@@ -1,0 +1,21 @@
+{
+  "registry_name": "titooo7's Plugins",
+  "registry_url": "https://github.com/titooo7/dispatcharr-sports-event-autocreator",
+  "root_url": "https://raw.githubusercontent.com/titooo7/dispatcharr-sports-event-autocreator/main/",
+  "plugins": [
+    {
+      "slug": "sports_event_autocreator",
+      "name": "Sports Event Auto-Creator",
+      "description": "Auto-creates event channels for sports (Boxing, Track & Field, MotoGP and more) from EPG and stream-name searches, with per-sport jobs edited in the UI and a configurable schedule.",
+      "author": "titooo7",
+      "license": "MIT",
+      "repo_url": "https://github.com/titooo7/dispatcharr-sports-event-autocreator",
+      "latest_version": "1.0.0",
+      "latest_url": "releases/sports_event_autocreator-1.0.0.zip",
+      "latest_sha256": "9a363031d846d79bd77c40976b4a89a9e3fcb694cff4bb7479174be23d8fd53f",
+      "latest_size": 54294,
+      "min_dispatcharr_version": "0.27.2",
+      "last_updated": "2026-07-11T00:00:00Z"
+    }
+  ]
+}

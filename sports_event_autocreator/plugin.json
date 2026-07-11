@@ -1,0 +1,175 @@
+{
+  "name": "Sports Event Auto-Creator",
+  "version": "1.0.0",
+  "description": "Auto-creates event channels for sports (Boxing, Track Field, MotoGP and other sports, ...) from EPG and stream-name searches, with per-sport jobs edited in the UI and a configurable schedule.",
+  "author": "titooo7",
+  "fields": [
+    {
+      "id": "schedule_info",
+      "label": "Scheduling",
+      "type": "info",
+      "description": "Set how often the auto-creation runs. Use the interval in minutes, or a 5-part cron expression for full control (cron wins when both are set). Press 'Apply schedule' after changing these. Interval 0 with no cron disables scheduled runs."
+    },
+    {
+      "id": "interval_minutes",
+      "label": "Run every N minutes",
+      "type": "number",
+      "default": 30,
+      "help_text": "How often to run all enabled jobs automatically (0 = disabled)."
+    },
+    {
+      "id": "cron_expression",
+      "label": "Cron expression (optional, overrides interval)",
+      "type": "string",
+      "default": "",
+      "placeholder": "e.g. */20 8-23 * * *",
+      "help_text": "5-part cron (minute hour day month weekday) in the system timezone."
+    },
+    {
+      "id": "display_timezone",
+      "label": "Display timezone",
+      "type": "string",
+      "default": "Europe/Madrid",
+      "help_text": "IANA timezone used for the times shown in channel names."
+    },
+    {
+      "id": "assign_epg",
+      "label": "Assign EPG to created channels",
+      "type": "boolean",
+      "default": true,
+      "help_text": "EPG-search channels are linked to the matched EPG source's guide data; name-search channels with a reliable time get a generated event programme (stored under the inactive 'Sports Event Auto-Creator' EPG source)."
+    },
+    {
+      "id": "event_duration_hours",
+      "label": "Generated event programme duration (hours)",
+      "type": "number",
+      "default": 3,
+      "help_text": "Length of the guide entry generated for name-search event channels."
+    },
+    {
+      "id": "use_stream_logo",
+      "label": "Use stream logo for created channels",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Created channels take the logo of their first stream that has one."
+    },
+    {
+      "id": "black_sample_seconds",
+      "label": "Black-screen probe seconds per stream",
+      "type": "number",
+      "default": 5,
+      "help_text": "Seconds of each stream ffmpeg samples when checking for a black screen (clamped to 3–30). Only used by jobs with 'Skip black-screen streams' enabled."
+    },
+    {
+      "id": "job_filter",
+      "label": "Job name for 'Run one job'",
+      "type": "string",
+      "default": "",
+      "placeholder": "e.g. boxeo",
+      "help_text": "Only used by the 'Run one job' action."
+    },
+    {
+      "id": "jobs_info",
+      "label": "Jobs",
+      "type": "info",
+      "description": "Enable the plugin to see the per-job settings fields — they are generated from the 'Job names' list. To add or remove a job: edit the list, Save, press 'Reload job fields', then refresh the page."
+    },
+    {
+      "id": "jobs_list",
+      "label": "Job names (comma-separated)",
+      "type": "string",
+      "help_text": "e.g. Track & Field, Boxing, Futsal, Rugby, Tennis"
+    },
+    {
+      "id": "transfer_json",
+      "label": "Jobs JSON (import / export box)",
+      "type": "text",
+      "default": "",
+      "help_text": "To IMPORT: paste a jobs JSON array here, press Save, then press 'Import jobs JSON' (replaces all job settings). To EXPORT: press 'Export jobs JSON', then refresh this page — the JSON appears in this box, ready to copy."
+    }
+  ],
+  "actions": [
+    {
+      "id": "status",
+      "label": "Show status",
+      "description": "Shows the schedule state, when it last fired, and the result of the last run.",
+      "button_label": "Status",
+      "button_variant": "subtle",
+      "button_color": "cyan"
+    },
+    {
+      "id": "run_now",
+      "label": "Run all jobs now",
+      "description": "Queues an immediate run of all enabled jobs (also applies the schedule).",
+      "button_label": "Run now",
+      "button_variant": "filled",
+      "button_color": "blue",
+      "confirm": {
+        "required": true,
+        "title": "Run all jobs?",
+        "message": "This will delete and recreate event channels in the target groups."
+      }
+    },
+    {
+      "id": "run_single",
+      "label": "Run one job",
+      "description": "Runs only the job named in the 'Job name' setting.",
+      "button_label": "Run job",
+      "button_variant": "outline",
+      "button_color": "blue"
+    },
+    {
+      "id": "dry_run",
+      "label": "Dry run (preview)",
+      "description": "Runs all enabled jobs without changing anything; results in the logs.",
+      "button_label": "Dry run",
+      "button_variant": "outline",
+      "button_color": "gray"
+    },
+    {
+      "id": "validate_config",
+      "label": "Validate configuration",
+      "description": "Checks all job settings for errors without running anything.",
+      "button_label": "Validate",
+      "button_variant": "subtle",
+      "button_color": "teal"
+    },
+    {
+      "id": "export_config",
+      "label": "Export jobs JSON",
+      "description": "Fills the 'Jobs JSON' box with the current configuration (refresh the page, then copy it). Also writes a file in the plugin folder.",
+      "button_label": "Export",
+      "button_variant": "subtle",
+      "button_color": "green"
+    },
+    {
+      "id": "import_config",
+      "label": "Import jobs JSON",
+      "description": "Replaces all job settings with the JSON pasted in the 'Jobs JSON' box (press Save first).",
+      "button_label": "Import",
+      "button_variant": "subtle",
+      "button_color": "green",
+      "confirm": {
+        "required": true,
+        "title": "Import jobs configuration?",
+        "message": "This replaces ALL current job settings with the pasted JSON. Global settings (schedule, timezone) are kept."
+      }
+    },
+    {
+      "id": "reload_fields",
+      "label": "Reload job fields",
+      "description": "Rebuilds the per-job settings fields after changing 'Job names'. Refresh the page afterwards.",
+      "button_label": "Reload fields",
+      "button_variant": "outline",
+      "button_color": "grape"
+    },
+    {
+      "id": "apply_schedule",
+      "label": "Apply schedule",
+      "description": "Creates/updates the background schedule from the settings above.",
+      "button_label": "Apply schedule",
+      "button_variant": "outline",
+      "button_color": "orange"
+    }
+  ]
+}
