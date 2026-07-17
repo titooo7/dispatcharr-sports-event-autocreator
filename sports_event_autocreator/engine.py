@@ -783,13 +783,40 @@ def is_channel_too_old(name: str, max_hours: float) -> bool:
         return False
 
 
-def exclude_matches(term: str, *texts: str) -> bool:
-    """Word-boundary exclusion check used consistently by all phases."""
-    term = term.strip()
+def term_matches(term: str, *texts: str) -> bool:
+    """Word-boundary term match used consistently by all phases.
+
+    A term matches when it appears as a whole word (case-insensitive) in any of
+    the given texts. This is the single "search dialect" shared by the exclude
+    filter and the record filter, so the user configures one familiar syntax.
+    """
+    term = (term or "").strip()
     if not term:
         return False
     pattern = rf"(?<!\w){re.escape(term)}(?!\w)"
     return any(re.search(pattern, t or "", re.IGNORECASE) for t in texts)
+
+
+def exclude_matches(term: str, *texts: str) -> bool:
+    """Word-boundary exclusion check used consistently by all phases."""
+    return term_matches(term, *texts)
+
+
+def record_matches(patterns: List[str], excludes: List[str], *texts: str) -> bool:
+    """Opt-in record filter for the DVR feature.
+
+    Returns True only when a title matches at least one ``patterns`` term and
+    none of the ``excludes`` terms. An empty ``patterns`` list records nothing
+    (recording is strictly opt-in — dozens of event channels per day must not
+    auto-record). Uses the exact same whole-word dialect as ``exclude_matches``.
+    """
+    if not patterns:
+        return False
+    if not any(term_matches(p, *texts) for p in patterns):
+        return False
+    if excludes and any(term_matches(x, *texts) for x in excludes):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------

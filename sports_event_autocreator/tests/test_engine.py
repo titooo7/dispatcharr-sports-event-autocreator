@@ -148,6 +148,46 @@ def test_exclude_matches_hashes_and_empty():
     assert engine.exclude_matches("F1", "") is False
 
 
+# --------------------------- term_matches -------------------------------
+
+def test_term_matches_word_boundary_and_case():
+    assert engine.term_matches("Canelo", "20:00 | Canelo vs Golovkin") is True
+    assert engine.term_matches("canelo", "CANELO VS GGG") is True
+    # substring inside a larger word must NOT match
+    assert engine.term_matches("Cane", "Canelo vs Golovkin") is False
+
+
+def test_term_matches_multiple_texts_and_empty():
+    assert engine.term_matches("UFC", "no match here", "UFC Fight Night") is True
+    assert engine.term_matches("", "anything") is False
+    assert engine.term_matches("UFC", "") is False
+
+
+# --------------------------- record_matches -----------------------------
+
+def test_record_matches_empty_patterns_records_nothing():
+    # Opt-in: no patterns => never record, even with a would-be match.
+    assert engine.record_matches([], [], "Canelo vs Golovkin") is False
+
+
+def test_record_matches_pattern_hit():
+    assert engine.record_matches(["Canelo"], [], "20:00 | Canelo vs Golovkin") is True
+    assert engine.record_matches(["Usyk"], [], "20:00 | Canelo vs Golovkin") is False
+
+
+def test_record_matches_exclude_overrides_pattern():
+    # A matching pattern is vetoed by a matching exclude term.
+    assert engine.record_matches(["Canelo"], ["Undercard"],
+                                 "Canelo vs Golovkin Undercard") is False
+    assert engine.record_matches(["Canelo"], ["Undercard"],
+                                 "Canelo vs Golovkin Main Card") is True
+
+
+def test_record_matches_checks_all_texts():
+    # Matches the event title even when the display-name text is the second arg.
+    assert engine.record_matches(["Boxing"], [], "18:00 | Fight", "Boxing Gala") is True
+
+
 # --------------------------- detect_country_flag ------------------------
 
 def test_detect_flag_prefix_beats_brand():

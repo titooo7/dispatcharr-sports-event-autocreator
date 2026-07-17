@@ -406,9 +406,20 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
             "ffmpeg_missing_logged": False,
         }
 
+        # Auto-DVR (Replays) settings.
+        def _num(key, default):
+            try:
+                return float(settings.get(key))
+            except (TypeError, ValueError):
+                return float(default)
+        record_pre_pad_min = max(0.0, _num("record_pre_pad_min", 5))
+        record_post_pad_min = max(0.0, _num("record_post_pad_min", 30))
+        retention_days = int(max(0.0, _num("replay_retention_days", 14)))
+        max_simultaneous_recordings = int(max(0.0, _num("max_simultaneous_recordings", 2)))
+
         xmltv_cache = {}
         totals = {"prepared": 0, "created": 0, "deleted": 0,
-                  "skipped": 0, "preserved": 0, "errors": 0}
+                  "skipped": 0, "preserved": 0, "errors": 0, "recorded": 0}
         per_job = {}
         for job in jobs:
             try:
@@ -416,7 +427,10 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
                                        assign_epg=assign_epg,
                                        event_duration_hours=event_duration_hours,
                                        use_stream_logo=use_stream_logo,
-                                       probe_state=probe_state)
+                                       probe_state=probe_state,
+                                       record_pre_pad_min=record_pre_pad_min,
+                                       record_post_pad_min=record_post_pad_min,
+                                       max_simultaneous_recordings=max_simultaneous_recordings)
                 per_job[job.name] = stats
                 for k in totals:
                     totals[k] += stats.get(k, 0)
@@ -425,10 +439,35 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
                 per_job[job.name] = {"error": str(e)}
                 totals["errors"] += 1
 
+        # Teamarr-group watcher: auto-record matching Teamarr event channels.
+        teamarr_stats = None
+        try:
+            teamarr_stats = runner.run_teamarr_watch(
+                runner._as_lines(settings.get("record_teamarr_groups")),
+                runner._as_lines(settings.get("record_teamarr_patterns")),
+                runner._as_lines(settings.get("record_teamarr_exclude")),
+                logger, dry_run, event_duration_hours,
+                record_pre_pad_min, record_post_pad_min,
+                max_simultaneous=max_simultaneous_recordings)
+            totals["recorded"] += teamarr_stats.get("created", 0)
+            totals["errors"] += teamarr_stats.get("errors", 0)
+        except Exception:
+            logger.exception("Teamarr watcher failed")
+
+        # Retention: prune aged / failed auto-DVR recordings (files + rows).
+        retention_stats = None
+        try:
+            retention_stats = runner.run_retention(retention_days, logger, dry_run)
+        except Exception:
+            logger.exception("Retention pass failed")
+
         prefix = "[DRY RUN] " if dry_run else ""
         summary = (f"{prefix}Sports Auto-Creator: {totals['created']} created, "
-                   f"{totals['deleted']} deleted, {totals['skipped']} skipped "
+                   f"{totals['deleted']} deleted, {totals['skipped']} skipped, "
+                   f"{totals['recorded']} recorded "
                    f"across {len(jobs)} job(s)"
+                   + (f", {retention_stats['deleted']} recording(s) pruned"
+                      if retention_stats and retention_stats.get("deleted") else "")
                    + (f" — {totals['errors']} error(s)" if totals['errors'] else "")
                    + (f" — {len(config_errors)} misconfigured job(s) skipped"
                       if config_errors else ""))

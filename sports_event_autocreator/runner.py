@@ -72,9 +72,12 @@ JOB_DEFAULTS = {
     "max_split": 0,             # cap per-programme channels when splitting
     "require_time": False,      # skip name-based streams without embedded time
     "check_black": False,       # probe EPG-match streams and skip black screens
+    "record_patterns": [],      # auto-DVR: record events whose title matches ANY of these
+    "record_exclude": [],       # auto-DVR: ...and NONE of these (opt-in; empty = record nothing)
 }
 
-_LIST_KEYS = {"search", "exclude", "exclude_stream_prefixes", "pin_top", "epg_sources"}
+_LIST_KEYS = {"search", "exclude", "exclude_stream_prefixes", "pin_top", "epg_sources",
+              "record_patterns", "record_exclude"}
 
 # Settings-key prefix for the per-source checkboxes:
 #   job:<job-name>:epgsrc:<source-name> -> bool
@@ -223,6 +226,14 @@ JOB_FIELD_SPECS = [
      "black screen OR failing the probe (HTTP error, timeout, no video) are "
      "skipped and the next candidate is tried — a probed stream must prove it "
      "plays. Name-search matches are never probed."),
+    ("record_patterns",  "lines",   "Auto-record: title patterns (one per line)",
+     "Auto-DVR is OPT-IN and selective: an event channel is recorded only when "
+     "its title matches at least one of these terms (whole-word, same syntax as "
+     "the Search/Exclude terms). Empty = record nothing (event channels are not "
+     "recorded). Recordings survive the channel being purged after the event."),
+    ("record_exclude",   "lines",   "Auto-record: exclude patterns (one per line)",
+     "Titles matching any of these are never recorded, even if they match a "
+     "record pattern above. Whole-word, case-insensitive."),
 ]
 
 PURGE_MODE_OPTIONS = [
@@ -666,6 +677,329 @@ def assign_channel_epg(channel_id: int, display_name: str, source: str,
 
 
 # ---------------------------------------------------------------------------
+# Auto-DVR recordings
+#
+# Selected event channels are auto-recorded by Dispatcharr's DVR. We only
+# create the Recording row (channel FK, padded aware-UTC start/end, tagged
+# custom_properties): Dispatcharr's post_save signal on Recording schedules the
+# ffmpeg job itself — the plugin never schedules anything. A start already in
+# the past but before end still records the remainder.
+# ---------------------------------------------------------------------------
+
+# Recordings we create carry custom_properties["auto_dvr"] = True. Retention
+# and the purge guard use this tag to tell plugin-owned recordings apart from
+# the user's manual DVR recordings (which must never be touched).
+AUTO_DVR_TAG = "auto_dvr"
+
+# File-cleanup roots, mirroring the fork's RecordingViewSet.destroy semantics
+# (apps/channels/api_views.py). ORM .delete() only removes the row, so we
+# delete the media files first and then prune now-empty parent directories.
+_RECORDINGS_ROOT = os.path.normpath("/data/recordings")
+_ALLOWED_FILE_ROOTS = ("/data/",)
+
+
+def ensure_recording(channel_id: int, event_start_utc_naive: datetime,
+                     duration_hours: float, pre_pad_min: float,
+                     post_pad_min: float, tag_props: Dict, logger,
+                     max_simultaneous: int = 0) -> bool:
+    """Create an auto-DVR Recording for an event channel unless one already
+    exists for the same event. Returns True if a recording was created.
+
+    ``event_start_utc_naive`` is naive UTC (as produced by the run loop's
+    sort_dt); it is made timezone-aware UTC before storing so Dispatcharr's
+    signal interprets it correctly. Dedup keys on
+    custom_properties.event_start (identity), NEVER on the padded start_time —
+    which shifts when the pre-pad setting changes and would double-book.
+
+    ``max_simultaneous`` (0 = unlimited) caps how many recordings (any origin,
+    manual or auto) may be airing at once — matching patterns can hit several
+    channels that are really the same broadcast (duplicate provider feeds), and
+    without this cap each one gets its own concurrent ffmpeg capture.
+    """
+    from apps.channels.models import Recording
+
+    event_start_utc = event_start_utc_naive.replace(tzinfo=timezone.utc)
+    event_iso = event_start_utc.isoformat()
+
+    # Dedup: skip if this channel already has an auto_dvr recording for the same
+    # event_start. Fallback: an auto_dvr recording with no stored event_start
+    # (older/other origin) also counts, to avoid double-booking the channel.
+    for rec in Recording.objects.filter(channel_id=channel_id):
+        cp = rec.custom_properties or {}
+        if not cp.get(AUTO_DVR_TAG):
+            continue
+        existing_iso = cp.get("event_start")
+        if existing_iso == event_iso or existing_iso is None:
+            return False
+
+    start = event_start_utc - timedelta(minutes=pre_pad_min)
+    end = (event_start_utc + timedelta(hours=duration_hours)
+           + timedelta(minutes=post_pad_min))
+
+    if max_simultaneous > 0:
+        overlapping = Recording.objects.filter(
+            start_time__lt=end, end_time__gt=start).count()
+        if overlapping >= max_simultaneous:
+            logger.info(
+                f"[MAX-SIMULTANEOUS] Skipping channel {channel_id}: "
+                f"{overlapping} recording(s) already overlap {start}–{end} "
+                f"(cap {max_simultaneous})")
+            return False
+
+    props = {AUTO_DVR_TAG: True, "event_start": event_iso}
+    props.update(tag_props or {})
+
+    Recording.objects.create(
+        channel_id=channel_id,
+        start_time=start,
+        end_time=end,
+        custom_properties=props,
+    )
+    return True
+
+
+def _has_active_or_future_recording(channel_id: int) -> bool:
+    """True if the channel has any recording currently running (status
+    'recording') or scheduled/ending in the future. Used by the purge guard
+    to avoid killing an in-progress or pending recording when a channel is
+    deleted after its event."""
+    from apps.channels.models import Recording
+    from django.utils.timezone import now as _now
+    now_ = _now()
+    for rec in Recording.objects.filter(channel_id=channel_id):
+        cp = rec.custom_properties or {}
+        if cp.get("status") == "recording":
+            return True
+        if rec.end_time and rec.end_time > now_:
+            return True
+    return False
+
+
+def _safe_remove_file(path, logger) -> None:
+    if not path or not isinstance(path, str):
+        return
+    try:
+        if any(path.startswith(root) for root in _ALLOWED_FILE_ROOTS) and os.path.exists(path):
+            os.remove(path)
+            logger.info(f"[RETENTION] Deleted recording file: {path}")
+    except Exception as ex:
+        logger.warning(f"[RETENTION] Failed to delete file {path}: {ex}")
+
+
+def _safe_rmtree_dir(path, logger) -> None:
+    if not path or not isinstance(path, str):
+        return
+    try:
+        if any(path.startswith(root) for root in _ALLOWED_FILE_ROOTS) and os.path.isdir(path):
+            shutil.rmtree(path)
+            logger.info(f"[RETENTION] Deleted recording HLS directory: {path}")
+    except Exception as ex:
+        logger.warning(f"[RETENTION] Failed to delete HLS directory {path}: {ex}")
+
+
+def _prune_empty_parents(path, logger) -> None:
+    """Remove now-empty parent directories up to (but not including) the
+    recordings root — same semantics as the fork's _prune_empty_parents."""
+    if not path or not isinstance(path, str):
+        return
+    try:
+        parent = os.path.dirname(os.path.normpath(path))
+        while (parent and parent != _RECORDINGS_ROOT
+               and parent.startswith(_RECORDINGS_ROOT + os.sep)
+               and os.path.isdir(parent) and not os.listdir(parent)):
+            try:
+                os.rmdir(parent)
+                logger.info(f"[RETENTION] Removed empty recording directory: {parent}")
+            except OSError:
+                break
+            parent = os.path.dirname(parent)
+    except Exception as ex:
+        logger.debug(f"[RETENTION] Unable to prune empty parents for {path}: {ex}")
+
+
+def _delete_recording_files(cp: Dict, logger) -> None:
+    """Delete the media artifacts of a recording (read from its
+    custom_properties, never guessed) and prune emptied directories."""
+    file_path = cp.get("file_path")
+    hls_dir = cp.get("_hls_dir")
+    _safe_remove_file(file_path, logger)
+    _safe_rmtree_dir(hls_dir, logger)
+    _prune_empty_parents(file_path, logger)
+    _prune_empty_parents(hls_dir, logger)
+
+
+def _recording_is_failed_or_zero(cp: Dict, status: str) -> bool:
+    """A finished auto-DVR recording that never produced usable media: not
+    'completed' (interrupted / never ran), or 'completed' with a zero-byte
+    file. Callers gate on age (>1 day) and never pass an active recording."""
+    if status == "completed":
+        file_path = cp.get("file_path")
+        if file_path:
+            try:
+                return os.path.getsize(file_path) == 0
+            except OSError:
+                # Completed but the file is already gone — leave to age-based
+                # retention rather than treating it as a failure here.
+                return False
+        return False
+    # Not completed and (per caller) finished over a day ago → failed.
+    return True
+
+
+def run_retention(retention_days: float, logger, dry_run: bool = False) -> Dict:
+    """Delete aged auto-DVR recordings (files first, then the row).
+
+    Removes recordings tagged ``auto_dvr`` whose end_time is older than
+    ``retention_days`` (0 disables age-based retention), plus failed/zero-byte
+    auto_dvr recordings older than 1 day. NEVER touches untagged (manual)
+    recordings or an actively-streaming recording.
+    """
+    from django.utils.timezone import now as _now
+    from apps.channels.models import Recording
+
+    stats = {"deleted": 0, "errors": 0}
+    now_ = _now()
+    age_cutoff = (now_ - timedelta(days=retention_days)
+                  if retention_days and retention_days > 0 else None)
+    failed_cutoff = now_ - timedelta(days=1)
+
+    for rec in list(Recording.objects.all()):
+        cp = rec.custom_properties or {}
+        if not cp.get(AUTO_DVR_TAG):
+            continue  # never touch manual recordings
+        status = cp.get("status", "")
+        if status == "recording":
+            continue  # never touch an active recording
+        if rec.end_time is None:
+            continue
+
+        remove = False
+        reason = ""
+        if age_cutoff is not None and rec.end_time < age_cutoff:
+            remove = True
+            reason = f"older than {retention_days:g}d"
+        elif rec.end_time < failed_cutoff and _recording_is_failed_or_zero(cp, status):
+            remove = True
+            reason = "failed/zero-byte >1d"
+
+        if not remove:
+            continue
+
+        if dry_run:
+            logger.info(f"[RETENTION] [DRY RUN] Would delete recording {rec.id} "
+                        f"({reason}): {cp.get('program', {}).get('title') or cp.get('file_path') or '?'}")
+            stats["deleted"] += 1
+            continue
+        try:
+            _delete_recording_files(cp, logger)
+            rec.delete()
+            logger.info(f"[RETENTION] Deleted auto-DVR recording {rec.id} ({reason})")
+            stats["deleted"] += 1
+        except Exception as e:
+            logger.error(f"[RETENTION] Failed to delete recording {rec.id}: {e}")
+            stats["errors"] += 1
+
+    return stats
+
+
+# Teamarr (this fork's Spanish-localized event scheduling) brackets the real
+# live programme with placeholder guide rows: a pre-game "coming up" filler
+# repeated until kickoff, and post-game "recap" filler after the match ends.
+# Neither carries the team names in a form useful for matching (the live row
+# itself is often generically titled, e.g. "Brasileirao - Soccer"), and the
+# recap rows would otherwise falsely match on team-name patterns for hours
+# after the real event is long over. Skip both; match team-name patterns
+# against the channel's own name (which Teamarr names as "HH:MM - Team A -
+# Team B") in addition to the programme title.
+_TEAMARR_PLACEHOLDER_PREFIX = "a continuación"
+_TEAMARR_RECAP_MARKER = "resumen"
+
+
+def run_teamarr_watch(group_names: List[str], patterns: List[str],
+                      excludes: List[str], logger, dry_run: bool,
+                      event_duration_hours: float, pre_pad_min: float,
+                      post_pad_min: float, max_simultaneous: int = 0) -> Dict:
+    """Auto-record Teamarr-generated event channels whose EPG programme title
+    matches the record patterns.
+
+    Teamarr event channels carry a tvg_id prefixed ``teamarr-event-`` (on the
+    channel or its linked EPGData). Recording is opt-in: with no groups or no
+    patterns configured this is a no-op. Programme start/end come from the
+    channel's linked EPG ProgramData rows.
+    """
+    stats = {"created": 0, "skipped": 0, "errors": 0}
+    if not group_names or not patterns:
+        return stats
+
+    from apps.channels.models import Channel, ChannelGroup
+    from apps.epg.models import ProgramData
+    from django.utils.timezone import now as _now
+
+    wanted = {g.strip().lower() for g in group_names if g.strip()}
+    group_ids = [g["id"] for g in ChannelGroup.objects.values("id", "name")
+                 if (g["name"] or "").lower() in wanted]
+    if not group_ids:
+        logger.info(f"[TEAMARR-WATCH] No channel groups match {sorted(wanted)}")
+        return stats
+
+    now_ = _now()
+    channels = (Channel.objects.filter(channel_group_id__in=group_ids)
+                .select_related("epg_data"))
+    for ch in channels:
+        epg = ch.epg_data
+        tvg = (ch.tvg_id or "")
+        epg_tvg = (epg.tvg_id if (epg and epg.tvg_id) else "")
+        if not (tvg.startswith("teamarr-event-") or epg_tvg.startswith("teamarr-event-")):
+            continue
+        if epg is None:
+            continue
+
+        for p in ProgramData.objects.filter(epg=epg).only(
+                "title", "start_time", "end_time"):
+            if p.start_time is None or p.end_time is None:
+                continue
+            if p.end_time < now_:
+                continue  # already over
+            title_lower = (p.title or "").strip().lower()
+            if title_lower.startswith(_TEAMARR_PLACEHOLDER_PREFIX):
+                continue  # pre-game filler, not the live broadcast
+            if _TEAMARR_RECAP_MARKER in title_lower:
+                continue  # post-game recap rerun, not the live broadcast
+            if not engine.record_matches(patterns, excludes, p.title or "", ch.name or ""):
+                continue
+
+            start = p.start_time
+            if start.tzinfo is not None:
+                start_naive_utc = start.astimezone(timezone.utc).replace(tzinfo=None)
+            else:
+                start_naive_utc = start
+            span = (p.end_time - p.start_time).total_seconds() / 3600.0
+            dur_hours = span if span > 0 else event_duration_hours
+
+            if dry_run:
+                logger.info(f"[TEAMARR-WATCH] [DRY RUN] Would record '{p.title}' "
+                            f"on channel {ch.id}")
+                stats["created"] += 1
+                continue
+            try:
+                created = ensure_recording(
+                    ch.id, start_naive_utc, dur_hours, pre_pad_min, post_pad_min,
+                    {"source": "teamarr-watch", "program": {"title": p.title}},
+                    logger, max_simultaneous=max_simultaneous)
+                if created:
+                    logger.info(f"[TEAMARR-WATCH] Scheduled recording for '{p.title}' "
+                                f"(channel {ch.id})")
+                    stats["created"] += 1
+                else:
+                    stats["skipped"] += 1
+            except Exception as e:
+                logger.error(f"[TEAMARR-WATCH] Failed to record '{p.title}': {e}")
+                stats["errors"] += 1
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # XMLTV fetching (Phase 1)
 # ---------------------------------------------------------------------------
 
@@ -943,7 +1277,10 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
             assign_epg: bool = True,
             event_duration_hours: float = 3.0,
             use_stream_logo: bool = True,
-            probe_state: Optional[Dict] = None) -> Dict:
+            probe_state: Optional[Dict] = None,
+            record_pre_pad_min: float = 5.0,
+            record_post_pad_min: float = 30.0,
+            max_simultaneous_recordings: int = 0) -> Dict:
     """
     Execute one job. Returns a stats dict:
     {prepared, created, deleted, skipped, preserved, errors}.
@@ -955,7 +1292,7 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
     """
     client = OrmClient()
     stats = {"prepared": 0, "created": 0, "deleted": 0,
-             "skipped": 0, "preserved": 0, "errors": 0}
+             "skipped": 0, "preserved": 0, "errors": 0, "recorded": 0}
 
     channels_to_create: List[Tuple] = []
     all_matched_stream_ids: set = set()
@@ -1395,6 +1732,18 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                     actually_deleted_names.add(ch_name)
                     stats["deleted"] += 1
                 else:
+                    # Purge guard: never delete a channel mid-recording or with
+                    # a pending/future recording — that would kill the ffmpeg
+                    # stream. Defer the deletion to a later run.
+                    try:
+                        if _has_active_or_future_recording(ch["id"]):
+                            logger.info(f"[{job.name}] [PURGE-GUARD] Deferred deleting "
+                                        f"'{ch_name}' ({reason}): it has an active or "
+                                        f"scheduled recording; will retry next run")
+                            continue
+                    except Exception:
+                        logger.exception(f"[{job.name}] [PURGE-GUARD] Recording check "
+                                         f"failed for '{ch_name}'; proceeding with delete")
                     try:
                         client.delete_channel(ch["id"])
                         logger.info(f"[{job.name}] Deleted ({reason}): '{ch_name}'")
@@ -1431,18 +1780,72 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                     preserved_names.add(ch.get("name", ""))
                     preserved_stream_ids.update(ch.get("streams", []))
 
+    # Existing channels of the target group, so the auto-DVR record filter can
+    # also reach SKIPPED (already-existing) and PRESERVED channels — otherwise
+    # adding a record pattern for a channel that already exists would never
+    # start a recording. Resolve by name first, then by any shared stream id.
+    group_channel_id_by_name: Dict[str, int] = {}
+    group_channel_id_by_stream: Dict[int, int] = {}
+    if target_group_id is not None:
+        for ch in all_existing_channels:
+            if (ch.get("channel_group") == target_group_id
+                    and ch.get("name") not in actually_deleted_names):
+                cid = ch.get("id")
+                group_channel_id_by_name.setdefault(ch.get("name"), cid)
+                for sid in ch.get("streams", []):
+                    group_channel_id_by_stream.setdefault(sid, cid)
+
+    def _resolve_existing_channel_id(display_name, ids):
+        cid = group_channel_id_by_name.get(display_name)
+        if cid is not None:
+            return cid
+        for sid in ids:
+            if sid in group_channel_id_by_stream:
+                return group_channel_id_by_stream[sid]
+        return None
+
+    def _maybe_record(chan_id, display_name, reason, sort_dt, is_uncertain):
+        """Auto-DVR: create a Recording for this event channel if the job's
+        record filter matches its title. Opt-in (no patterns → nothing), and
+        skipped for dry runs, unknown channel ids, and uncertain-time streams
+        (a guessed time would schedule the recording wrong)."""
+        if dry_run or chan_id is None or sort_dt is None or is_uncertain:
+            return
+        if not job.record_patterns:
+            return
+        if not engine.record_matches(job.record_patterns, job.record_exclude,
+                                     display_name, reason):
+            return
+        try:
+            created_rec = ensure_recording(
+                chan_id, sort_dt, event_duration_hours,
+                record_pre_pad_min, record_post_pad_min,
+                {"source": "sports-plugin", "job": job.name,
+                 "program": {"title": display_name}}, logger,
+                max_simultaneous=max_simultaneous_recordings)
+            if created_rec:
+                logger.info(f"[{job.name}] [DVR] Scheduled recording for '{display_name}'")
+                stats["recorded"] += 1
+        except Exception as e:
+            logger.error(f"[{job.name}] [DVR] Failed to schedule recording for "
+                         f"'{display_name}': {e}")
+            stats["errors"] += 1
+
     logger.info(f"[{job.name}] Creating/updating {len(channels_to_create)} channels...")
     current_chan_num = job.start_number
     for display_name, ids, source, reason, sort_dt, is_uncertain, tvg_id, epg_src_label in channels_to_create:
         if display_name in existing_names or any(sid in streams_in_group for sid in ids):
+            existing_cid = _resolve_existing_channel_id(display_name, ids)
             if display_name in preserved_names or any(sid in preserved_stream_ids for sid in ids):
                 logger.info(f"[{job.name}] [PRESERVED] [{source}] Kept (below threshold): '{display_name}'")
                 stats["preserved"] += 1
+                _maybe_record(existing_cid, display_name, reason, sort_dt, is_uncertain)
                 if current_chan_num is not None:
                     current_chan_num += 1
                 continue
             logger.info(f"[{job.name}] [SKIPPED] [{source}] Already exists in group: '{display_name}'")
             stats["skipped"] += 1
+            _maybe_record(existing_cid, display_name, reason, sort_dt, is_uncertain)
             if current_chan_num is not None:
                 current_chan_num += 1
             continue
@@ -1472,6 +1875,7 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                     except Exception as e:
                         # EPG is a nicety; never fail the run over it.
                         logger.error(f"[{job.name}] [EPG-ASSIGN] Failed for '{display_name}': {e}")
+                _maybe_record(new_ch["id"], display_name, reason, sort_dt, is_uncertain)
             except Exception as e:
                 logger.error(f"[{job.name}] [{source}] Failed to create '{display_name}': {e}")
                 stats["errors"] += 1

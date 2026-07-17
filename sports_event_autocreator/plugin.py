@@ -94,6 +94,87 @@ GLOBAL_FIELDS = [
         ),
     },
     {
+        "id": "dvr_info",
+        "label": "Auto-DVR / Replays",
+        "type": "info",
+        "description": (
+            "Selected event channels can be auto-recorded by Dispatcharr's DVR. "
+            "Recording is OPT-IN and per job: set 'Auto-record: title patterns' on "
+            "a job (below) to record only the events you care about — an empty "
+            "pattern list records nothing. These global settings control the "
+            "padding, retention, and an optional watcher for Teamarr event channels."
+        ),
+    },
+    {
+        "id": "record_pre_pad_min",
+        "label": "Recording pre-roll padding (minutes)",
+        "type": "number",
+        "default": 5,
+        "help_text": "Start each auto-recording this many minutes before the event start time.",
+    },
+    {
+        "id": "record_post_pad_min",
+        "label": "Recording post-roll padding (minutes)",
+        "type": "number",
+        "default": 30,
+        "help_text": "Keep recording this many minutes after the event's scheduled end (overruns).",
+    },
+    {
+        "id": "replay_retention_days",
+        "label": "Replay retention (days)",
+        "type": "number",
+        "default": 14,
+        "help_text": (
+            "Delete auto-created recordings (files + rows) once they are older than "
+            "this many days. 0 disables age-based deletion. Failed/zero-byte "
+            "auto-recordings are always cleaned up after 1 day. Manual recordings "
+            "are never touched."
+        ),
+    },
+    {
+        "id": "max_simultaneous_recordings",
+        "label": "Max simultaneous recordings (0 = unlimited)",
+        "type": "number",
+        "default": 2,
+        "help_text": (
+            "Caps how many recordings (any origin, manual or auto) may be airing "
+            "at once. Patterns can match several channels that are really the same "
+            "broadcast (duplicate provider feeds for one event) — without this cap "
+            "each one gets its own concurrent recording, which can exceed your "
+            "available simultaneous stream connections. Extra matches beyond the "
+            "cap are skipped and logged, not queued."
+        ),
+    },
+    {
+        "id": "record_teamarr_groups",
+        "label": "Teamarr watcher: channel groups (one per line)",
+        "type": "text",
+        "default": "",
+        "help_text": (
+            "Optional. Names of channel groups holding Teamarr event channels "
+            "(tvg-id prefix 'teamarr-event-'). Their EPG programmes are watched "
+            "and matching ones auto-recorded. Empty = watcher off."
+        ),
+    },
+    {
+        "id": "record_teamarr_patterns",
+        "label": "Teamarr watcher: title patterns (one per line)",
+        "type": "text",
+        "default": "",
+        "help_text": (
+            "Record a Teamarr programme only when its title matches at least one "
+            "of these terms (whole-word, same syntax as the job Search terms). "
+            "Empty = record nothing."
+        ),
+    },
+    {
+        "id": "record_teamarr_exclude",
+        "label": "Teamarr watcher: exclude patterns (one per line)",
+        "type": "text",
+        "default": "",
+        "help_text": "Teamarr programme titles matching any of these are never recorded.",
+    },
+    {
         "id": "job_filter",
         "label": "Job name for 'Run one job'",
         "type": "string",
@@ -243,7 +324,7 @@ def _touch_reload_token() -> None:
 
 class Plugin:
     name = "Sports Event Auto-Creator"
-    version = "1.0.0"
+    version = "1.1.1"
     description = (
         "Auto-creates event channels for sports (boxing, MotoGP, Tennis, ...) from "
         "EPG and stream-name searches, with per-sport jobs and a configurable schedule."

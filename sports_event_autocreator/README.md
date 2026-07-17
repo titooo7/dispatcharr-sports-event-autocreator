@@ -41,6 +41,11 @@ ORM) — no URL, username or password needed.
 | Run every N minutes | Scheduled run frequency. `0` disables scheduling. |
 | Cron expression | Optional 5-part cron (system timezone). Overrides the interval. E.g. `*/20 8-23 * * *` = every 20 min between 08:00–23:59. |
 | Display timezone | Timezone for the `HH:MM, DD-MMM` prefixes in channel names (default `Europe/Madrid`). |
+| Recording pre-roll padding (minutes) | Start each auto-recording this many minutes before the event start (default `5`). |
+| Recording post-roll padding (minutes) | Keep recording this many minutes past the event's scheduled end (default `30`). |
+| Replay retention (days) | Delete auto-created recordings older than this (files + rows); `0` disables age-based deletion (default `14`). Failed/zero-byte auto-recordings are always cleaned after 1 day. Manual recordings are never touched. |
+| Max simultaneous recordings (0 = unlimited) | Caps how many recordings (any origin) may be airing at once (default `2`). Patterns can match several channels that are really the same broadcast (duplicate provider feeds for one event); extras beyond the cap are skipped and logged, not queued. |
+| Teamarr watcher: channel groups / title patterns / exclude patterns | Optional watcher that auto-records Teamarr event channels (see *Auto-DVR / Replays* below). Empty groups or empty patterns = off. |
 | Job name for 'Run one job' | Which job the *Run one job* button runs. |
 | Job names | Comma-separated list of jobs; drives which per-job field groups exist. |
 
@@ -78,6 +83,8 @@ flag mapping:
 | One channel per stream / max | `--split-streams --max-split` | |
 | Require embedded date/time | `--require-time` | Needs an actual date (day+month or a weekday); a bare time like `8:10pm` is skipped, since it would be re-read as "today" forever. | |
 | Skip black-screen streams (EPG matches) | — | Probes each candidate stream of an EPG match with ffmpeg; black screens and failed probes are skipped, failing over to the next candidate. Name-search matches are never probed. See *Black-screen filtering* below. |
+| Auto-record: title patterns | — | Opt-in auto-DVR. Record an event channel only when its title matches at least one term (whole-word, same syntax as *Search terms*). Empty = record nothing. One per line. See *Auto-DVR / Replays* below. |
+| Auto-record: exclude patterns | — | Titles matching any of these are never recorded, even if they match a record pattern. One per line. |
 
 ### Sharing configuration (import / export)
 
@@ -200,6 +207,54 @@ Details and caveats:
 - Probing also runs during **Dry run** (it is read-only) so you can preview
   verdicts. Every decision is logged with the `[BLACK-CHECK]` tag, e.g.
   `[BLACK-CHECK] 'Team A vs Team B': stream 'ES: … 20:00' → BLACK (YAVG 16.2) — skipped`.
+
+## Auto-DVR / Replays
+
+Selected event channels can be **auto-recorded** by Dispatcharr's built-in DVR,
+so finished events become a replay library. Recording is **strictly opt-in and
+selective** — with dozens of event channels created per day, nothing is recorded
+unless you ask for it:
+
+- Set **Auto-record: title patterns** on a job to record only matching events
+  (e.g. a boxing job that records only `Canelo`, `Usyk`). The patterns use the
+  same whole-word syntax as *Search terms*; **Auto-record: exclude patterns**
+  vetoes a match. An empty pattern list records nothing.
+- The filter is evaluated for **every** matched event channel of the job —
+  newly created ones *and* channels that already exist (so adding a pattern for
+  an existing channel starts recording it on the next run).
+- Each recording is padded by the global **pre-roll**/**post-roll** minutes and
+  tagged as plugin-owned (`custom_properties.auto_dvr = true`). The plugin only
+  creates the `Recording` row; Dispatcharr's own signal schedules the ffmpeg
+  job. A start time already in the past but before the end still records the
+  remainder.
+- **De-duplication** keys on the event's start time (`event_start`), not the
+  padded recording start — so changing the padding never double-books, and
+  re-runs don't create duplicates.
+- Name-search events whose timezone couldn't be reliably inferred are **not**
+  recorded (a guessed start time would schedule the recording wrong).
+
+**Teamarr watcher** (optional): set **Teamarr watcher: channel groups** to the
+group(s) holding Teamarr event channels (they carry a `teamarr-event-` tvg-id
+prefix) plus **Teamarr watcher: title patterns** (and optional excludes). Each
+run reads those channels' EPG programme times and records matching, not-yet-past
+programmes — same opt-in rule, padding, dedup and tagging as jobs
+(`source: "teamarr-watch"`). Patterns are matched against **both** the
+programme title and the channel's own name (Teamarr names channels
+`HH:MM - Team A - Team B`), and pre-game "coming up" filler rows (titles
+starting with "A continuación") and post-game "recap" rows (titles containing
+"Resumen") are skipped — the live match itself is often titled generically
+(e.g. "Brasileirao - Soccer", no team names), so matching needs the channel
+name and needs to avoid locking onto a recap rerun hours after the real event.
+
+**Retention** keeps the disk in check: recordings tagged `auto_dvr` older than
+**Replay retention (days)** are deleted (media files first, then the DB row,
+pruning now-empty folders), and failed/zero-byte auto-recordings are cleaned up
+after 1 day. Manual (untagged) recordings are **never** touched. Set the
+retention to `0` to disable age-based deletion.
+
+A **purge guard** protects in-flight recordings: the normal channel cleanup
+will not delete an event channel that has a recording currently in progress or
+scheduled/ending in the future — it defers that deletion to a later run.
 
 ## Behavior notes
 
