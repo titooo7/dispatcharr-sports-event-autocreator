@@ -691,6 +691,52 @@ def assign_channel_epg(channel_id: int, display_name: str, source: str,
 # the user's manual DVR recordings (which must never be touched).
 AUTO_DVR_TAG = "auto_dvr"
 
+# Plugin-private state for the auto-DVR feature (tombstones). Lives next to
+# the plugin code under /data so it survives container rebuilds. chmod 666
+# after writing: celery runs as root while manual runs may execute as the
+# web user, and either must be able to rewrite it.
+_DVR_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "auto_dvr_state.json")
+
+
+def _event_key(title: str, event_iso: str) -> str:
+    """Stable identity of a real-world event: normalized title + start time.
+
+    Recording dedup must key on the event itself, never on channel_id:
+    duplicate provider feeds surface as separate channels with identical
+    display names, and purge_group recreates channels with fresh ids every
+    run, so a channel_id-based dedup re-records the same broadcast once per
+    duplicate feed and once per recreation.
+    """
+    norm = re.sub(r"\s+", " ", (title or "").strip().lower())
+    return f"{norm}|{event_iso}"
+
+
+def _load_dvr_state() -> Dict:
+    try:
+        with open(_DVR_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("created"), dict):
+            return data
+    except Exception:
+        pass
+    return {"created": {}}
+
+
+def _save_dvr_state(state: Dict, logger) -> None:
+    try:
+        tmp = _DVR_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, _DVR_STATE_FILE)
+        try:
+            os.chmod(_DVR_STATE_FILE, 0o666)
+        except OSError:
+            pass
+    except Exception as e:
+        logger.warning(f"[DVR] Could not persist auto-DVR state "
+                       f"(user-deletion tombstones degraded): {e}")
+
 # File-cleanup roots, mirroring the fork's RecordingViewSet.destroy semantics
 # (apps/channels/api_views.py). ORM .delete() only removes the row, so we
 # delete the media files first and then prune now-empty parent directories.
@@ -712,41 +758,68 @@ def ensure_recording(channel_id: int, event_start_utc_naive: datetime,
     which shifts when the pre-pad setting changes and would double-book.
 
     ``max_simultaneous`` (0 = unlimited) caps how many recordings (any origin,
-    manual or auto) may be airing at once — matching patterns can hit several
-    channels that are really the same broadcast (duplicate provider feeds), and
-    without this cap each one gets its own concurrent ffmpeg capture.
+    manual or auto) may be airing at once — genuinely distinct events can
+    overlap, and the provider's concurrent-stream budget is finite. Rows whose
+    status marks them dead (interrupted/failed/stopped/completed) do not
+    occupy a slot.
+
+    Dedup is by **event identity** (normalized title + event_start), checked
+    across ALL auto_dvr recordings regardless of channel — see ``_event_key``.
+    A tombstone check makes user deletions stick: if the plugin previously
+    created a recording for this exact event and the row is now gone, the user
+    deleted it on purpose, so it is never re-created ("record the remainder"
+    resurrection was a real user-reported annoyance).
     """
     from apps.channels.models import Recording
 
     event_start_utc = event_start_utc_naive.replace(tzinfo=timezone.utc)
     event_iso = event_start_utc.isoformat()
+    title = ((tag_props or {}).get("program") or {}).get("title", "")
+    key = _event_key(title, event_iso)
 
-    # Dedup: skip if this channel already has an auto_dvr recording for the same
-    # event_start. Fallback: an auto_dvr recording with no stored event_start
-    # (older/other origin) also counts, to avoid double-booking the channel.
-    for rec in Recording.objects.filter(channel_id=channel_id):
+    # Dedup by event identity across every auto_dvr recording. Legacy rows
+    # (created before event_key existed) are compared via the same key derived
+    # from their stored program title + event_start. The old per-channel
+    # no-event_start fallback is kept for rows of unknown origin.
+    for rec in Recording.objects.all():
         cp = rec.custom_properties or {}
         if not cp.get(AUTO_DVR_TAG):
             continue
-        existing_iso = cp.get("event_start")
-        if existing_iso == event_iso or existing_iso is None:
+        existing_key = cp.get("event_key") or _event_key(
+            ((cp.get("program") or {}).get("title", "")),
+            cp.get("event_start") or "")
+        if existing_key == key:
             return False
+        if rec.channel_id == channel_id and cp.get("event_start") is None:
+            return False
+
+    # Tombstone: we created a recording for this event before and its row no
+    # longer exists — the user deleted it. Do not resurrect it.
+    state = _load_dvr_state()
+    if key in state["created"]:
+        logger.info(f"[DVR] [TOMBSTONE] Not re-creating recording for "
+                    f"'{title}' ({event_iso}): previously created and since "
+                    f"deleted by the user")
+        return False
 
     start = event_start_utc - timedelta(minutes=pre_pad_min)
     end = (event_start_utc + timedelta(hours=duration_hours)
            + timedelta(minutes=post_pad_min))
 
     if max_simultaneous > 0:
-        overlapping = Recording.objects.filter(
-            start_time__lt=end, end_time__gt=start).count()
+        overlapping = (Recording.objects
+                       .filter(start_time__lt=end, end_time__gt=start)
+                       .exclude(custom_properties__status__in=[
+                           "interrupted", "failed", "stopped", "completed"])
+                       .count())
         if overlapping >= max_simultaneous:
             logger.info(
                 f"[MAX-SIMULTANEOUS] Skipping channel {channel_id}: "
-                f"{overlapping} recording(s) already overlap {start}–{end} "
-                f"(cap {max_simultaneous})")
+                f"{overlapping} live/pending recording(s) already overlap "
+                f"{start}–{end} (cap {max_simultaneous})")
             return False
 
-    props = {AUTO_DVR_TAG: True, "event_start": event_iso}
+    props = {AUTO_DVR_TAG: True, "event_start": event_iso, "event_key": key}
     props.update(tag_props or {})
 
     Recording.objects.create(
@@ -755,6 +828,21 @@ def ensure_recording(channel_id: int, event_start_utc_naive: datetime,
         end_time=end,
         custom_properties=props,
     )
+
+    # Remember the creation so a later user deletion is distinguishable from
+    # "never existed"; prune entries once the event is 2+ days over.
+    cutoff = datetime.now(timezone.utc) - timedelta(days=2)
+
+    def _still_relevant(entry):
+        try:
+            return datetime.fromisoformat(entry.get("end", "")) > cutoff
+        except (ValueError, TypeError):
+            return False
+
+    state["created"][key] = {"end": end.isoformat()}
+    state["created"] = {k: v for k, v in state["created"].items()
+                        if _still_relevant(v)}
+    _save_dvr_state(state, logger)
     return True
 
 
@@ -908,11 +996,38 @@ def run_retention(retention_days: float, logger, dry_run: bool = False) -> Dict:
 # Neither carries the team names in a form useful for matching (the live row
 # itself is often generically titled, e.g. "Brasileirao - Soccer"), and the
 # recap rows would otherwise falsely match on team-name patterns for hours
-# after the real event is long over. Skip both; match team-name patterns
-# against the channel's own name (which Teamarr names as "HH:MM - Team A -
-# Team B") in addition to the programme title.
+# after the real event is long over.
+#
+# Primary selection is an ALLOWLIST BY TIME: Teamarr names the channel
+# "HH:MM - Team A - Team B" (display timezone), so the EPG row whose span
+# covers that wall-clock moment is the live broadcast — robust against any
+# future change in Teamarr's filler wording. The Spanish title markers below
+# are only the fallback for channels whose name carries no parseable time.
 _TEAMARR_PLACEHOLDER_PREFIX = "a continuación"
 _TEAMARR_RECAP_MARKER = "resumen"
+
+
+def _row_covers_local_time(start, end, hhmm) -> Optional[bool]:
+    """Whether the [start, end) EPG row covers the given local wall-clock
+    time (display timezone). Tries the row's start and end dates as base
+    days so rows crossing midnight are handled. Returns None when the check
+    cannot be performed — the caller then falls back to title markers.
+    """
+    try:
+        def _to_local(dt):
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return engine.convert_utc_to_display(dt)
+
+        start_local, end_local = _to_local(start), _to_local(end)
+        hh, mm = hhmm
+        for base in (start_local, end_local):
+            cand = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if start_local <= cand < end_local:
+                return True
+        return False
+    except Exception:
+        return None
 
 
 def run_teamarr_watch(group_names: List[str], patterns: List[str],
@@ -954,17 +1069,29 @@ def run_teamarr_watch(group_names: List[str], patterns: List[str],
         if epg is None:
             continue
 
+        # Event start time embedded in the channel name ("HH:MM - A - B").
+        name_time = re.match(r"^\s*(\d{1,2}):(\d{2})\b", ch.name or "")
+        event_hhmm = ((int(name_time.group(1)), int(name_time.group(2)))
+                      if name_time else None)
+
         for p in ProgramData.objects.filter(epg=epg).only(
                 "title", "start_time", "end_time"):
             if p.start_time is None or p.end_time is None:
                 continue
             if p.end_time < now_:
                 continue  # already over
-            title_lower = (p.title or "").strip().lower()
-            if title_lower.startswith(_TEAMARR_PLACEHOLDER_PREFIX):
-                continue  # pre-game filler, not the live broadcast
-            if _TEAMARR_RECAP_MARKER in title_lower:
-                continue  # post-game recap rerun, not the live broadcast
+            covered = (_row_covers_local_time(p.start_time, p.end_time, event_hhmm)
+                       if event_hhmm is not None else None)
+            if covered is False:
+                continue  # placeholder/recap row, not the live broadcast
+            if covered is None:
+                # No usable time in the channel name — fall back to skipping
+                # Teamarr's known filler rows by their Spanish title markers.
+                title_lower = (p.title or "").strip().lower()
+                if title_lower.startswith(_TEAMARR_PLACEHOLDER_PREFIX):
+                    continue
+                if _TEAMARR_RECAP_MARKER in title_lower:
+                    continue
             if not engine.record_matches(patterns, excludes, p.title or "", ch.name or ""):
                 continue
 
@@ -1742,8 +1869,13 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                                         f"scheduled recording; will retry next run")
                             continue
                     except Exception:
+                        # Fail CLOSED: deleting a channel is destructive (it
+                        # kills any in-flight ffmpeg capture), so an error in
+                        # the recording check defers the deletion to a later
+                        # run instead of proceeding blind.
                         logger.exception(f"[{job.name}] [PURGE-GUARD] Recording check "
-                                         f"failed for '{ch_name}'; proceeding with delete")
+                                         f"failed for '{ch_name}'; deferring deletion")
+                        continue
                     try:
                         client.delete_channel(ch["id"])
                         logger.info(f"[{job.name}] Deleted ({reason}): '{ch_name}'")

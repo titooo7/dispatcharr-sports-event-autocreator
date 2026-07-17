@@ -1,6 +1,6 @@
 {
   "name": "Sports Event Auto-Creator",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Auto-creates event channels for sports (Boxing, Track Field, MotoGP and other sports, ...) from EPG and stream-name searches, with per-sport jobs edited in the UI and a configurable schedule.",
   "author": "titooo7",
   "fields": [
@@ -86,6 +86,13 @@
       "type": "number",
       "default": 14,
       "help_text": "Delete auto-created recordings (files + rows) once they are older than this many days. 0 disables age-based deletion. Failed/zero-byte auto-recordings are always cleaned up after 1 day. Manual recordings are never touched."
+    },
+    {
+      "id": "max_simultaneous_recordings",
+      "label": "Max simultaneous recordings (0 = unlimited)",
+      "type": "number",
+      "default": 2,
+      "help_text": "Caps how many recordings (any origin, manual or auto) may be airing at once. Recordings whose status marks them dead (interrupted/failed/stopped/completed) do not occupy a slot. Extra matches beyond the cap are skipped and logged, not queued."
     },
     {
       "id": "record_teamarr_groups",

@@ -138,11 +138,12 @@ GLOBAL_FIELDS = [
         "default": 2,
         "help_text": (
             "Caps how many recordings (any origin, manual or auto) may be airing "
-            "at once. Patterns can match several channels that are really the same "
-            "broadcast (duplicate provider feeds for one event) — without this cap "
-            "each one gets its own concurrent recording, which can exceed your "
-            "available simultaneous stream connections. Extra matches beyond the "
-            "cap are skipped and logged, not queued."
+            "at once — genuinely distinct events can overlap and your provider's "
+            "concurrent-stream budget is finite. Duplicate feeds of one broadcast "
+            "are already deduplicated by event identity, so this only gates "
+            "different events. Recordings whose status marks them dead "
+            "(interrupted/failed/stopped/completed) do not occupy a slot. Extra "
+            "matches beyond the cap are skipped and logged, not queued."
         ),
     },
     {
@@ -324,7 +325,7 @@ def _touch_reload_token() -> None:
 
 class Plugin:
     name = "Sports Event Auto-Creator"
-    version = "1.1.1"
+    version = "1.1.2"
     description = (
         "Auto-creates event channels for sports (boxing, MotoGP, Tennis, ...) from "
         "EPG and stream-name searches, with per-sport jobs and a configurable schedule."

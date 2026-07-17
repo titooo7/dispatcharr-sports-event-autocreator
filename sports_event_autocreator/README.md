@@ -44,7 +44,7 @@ ORM) — no URL, username or password needed.
 | Recording pre-roll padding (minutes) | Start each auto-recording this many minutes before the event start (default `5`). |
 | Recording post-roll padding (minutes) | Keep recording this many minutes past the event's scheduled end (default `30`). |
 | Replay retention (days) | Delete auto-created recordings older than this (files + rows); `0` disables age-based deletion (default `14`). Failed/zero-byte auto-recordings are always cleaned after 1 day. Manual recordings are never touched. |
-| Max simultaneous recordings (0 = unlimited) | Caps how many recordings (any origin) may be airing at once (default `2`). Patterns can match several channels that are really the same broadcast (duplicate provider feeds for one event); extras beyond the cap are skipped and logged, not queued. |
+| Max simultaneous recordings (0 = unlimited) | Caps how many recordings (any origin) may be airing at once (default `2`) — distinct events can overlap and the provider's concurrent-stream budget is finite. Duplicate feeds of one broadcast are already deduplicated by event identity, so this only gates different events. Dead rows (interrupted/failed/stopped/completed) don't occupy a slot. Extras beyond the cap are skipped and logged, not queued. |
 | Teamarr watcher: channel groups / title patterns / exclude patterns | Optional watcher that auto-records Teamarr event channels (see *Auto-DVR / Replays* below). Empty groups or empty patterns = off. |
 | Job name for 'Run one job' | Which job the *Run one job* button runs. |
 | Job names | Comma-separated list of jobs; drives which per-job field groups exist. |
@@ -227,9 +227,15 @@ unless you ask for it:
   creates the `Recording` row; Dispatcharr's own signal schedules the ffmpeg
   job. A start time already in the past but before the end still records the
   remainder.
-- **De-duplication** keys on the event's start time (`event_start`), not the
-  padded recording start — so changing the padding never double-books, and
-  re-runs don't create duplicates.
+- **De-duplication** keys on the **event's identity** (normalized title +
+  `event_start`), checked across *all* auto-recordings regardless of channel —
+  so duplicate provider feeds of one broadcast produce a single recording,
+  purge/recreate cycles (which give channels fresh ids every run) don't
+  double-book, and changing the padding never does either.
+- **User deletions stick**: if you delete an auto-created recording, the
+  plugin remembers (a tombstone in `auto_dvr_state.json` next to the plugin
+  code) and will not re-create a recording for that same event — even while
+  the event is still airing.
 - Name-search events whose timezone couldn't be reliably inferred are **not**
   recorded (a guessed start time would schedule the recording wrong).
 
@@ -240,11 +246,14 @@ run reads those channels' EPG programme times and records matching, not-yet-past
 programmes — same opt-in rule, padding, dedup and tagging as jobs
 (`source: "teamarr-watch"`). Patterns are matched against **both** the
 programme title and the channel's own name (Teamarr names channels
-`HH:MM - Team A - Team B`), and pre-game "coming up" filler rows (titles
-starting with "A continuación") and post-game "recap" rows (titles containing
-"Resumen") are skipped — the live match itself is often titled generically
-(e.g. "Brasileirao - Soccer", no team names), so matching needs the channel
-name and needs to avoid locking onto a recap rerun hours after the real event.
+`HH:MM - Team A - Team B`) — the live match itself is often titled
+generically (e.g. "Brasileirao - Soccer", no team names). Which EPG row is
+the live broadcast is decided **by time**: the row whose span covers the
+`HH:MM` embedded in the channel name (display timezone) is the match; the
+pre-game "coming up" and post-game "recap" filler rows around it are never
+recorded. If a channel name carries no parseable time, the watcher falls
+back to skipping rows by Teamarr's Spanish filler markers ("A continuación"
+prefix / "Resumen").
 
 **Retention** keeps the disk in check: recordings tagged `auto_dvr` older than
 **Replay retention (days)** are deleted (media files first, then the DB row,
