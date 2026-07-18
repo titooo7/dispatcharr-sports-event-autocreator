@@ -74,6 +74,7 @@ JOB_DEFAULTS = {
     "check_black": False,       # probe EPG-match streams and skip black screens
     "record_patterns": [],      # auto-DVR: record events whose title matches ANY of these
     "record_exclude": [],       # auto-DVR: ...and NONE of these (opt-in; empty = record nothing)
+    "record_duration_hours": 0,  # auto-DVR: length when the EPG has none (0 = global default)
 }
 
 _LIST_KEYS = {"search", "exclude", "exclude_stream_prefixes", "pin_top", "epg_sources",
@@ -234,6 +235,11 @@ JOB_FIELD_SPECS = [
     ("record_exclude",   "lines",   "Auto-record: exclude patterns (one per line)",
      "Titles matching any of these are never recorded, even if they match a "
      "record pattern above. Whole-word, case-insensitive."),
+    ("record_duration_hours", "number", "Auto-record: duration (hours, 0 = auto)",
+     "Recording length for this job's events when their real duration is "
+     "unknown — name-search events, or EPG matches without an end time. "
+     "0 = use the global 'Generated event programme duration'. When the EPG "
+     "provides the programme's real length, that always wins over this."),
 ]
 
 PURGE_MODE_OPTIONS = [
@@ -339,6 +345,9 @@ def job_from_settings(settings: dict, name: str, seeds: Dict[str, dict]) -> Simp
         elif key in ("start_number", "preserve_below", "preserve_above", "max_past_hours", "max_future_hours"):
             num = _as_number(value, 0)
             cfg[key] = num if num > 0 else None
+        elif key == "record_duration_hours":
+            num = _as_number(value, 0)
+            cfg[key] = min(num, 12.0) if num > 0 else 0  # 0 = auto, clamp 12h
         elif key == "days":
             cfg[key] = max(int(_as_number(value, JOB_DEFAULTS["days"])), 1)
         elif key == "max_split":
@@ -1978,7 +1987,10 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                                      display_name, reason):
             return
         try:
-            dur_hours = record_duration_by_name.get(display_name) or event_duration_hours
+            # Priority: real EPG span > per-job override > global default.
+            dur_hours = (record_duration_by_name.get(display_name)
+                         or job.record_duration_hours
+                         or event_duration_hours)
             created_rec = ensure_recording(
                 chan_id, sort_dt, dur_hours,
                 record_pre_pad_min, record_post_pad_min,

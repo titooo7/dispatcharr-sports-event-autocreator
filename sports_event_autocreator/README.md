@@ -228,10 +228,13 @@ unless you ask for it:
   job. A start time already in the past but before the end still records the
   remainder.
 - **Recording length follows the EPG**: for EPG-matched events the recording
-  covers the programme's real start→end span (plus the pads). Only
-  name-search events — whose duration is unknown — fall back to the global
-  *Generated event programme duration* setting. (Teamarr-watcher recordings
-  already used the EPG span.)
+  covers the programme's real start→end span (plus the pads). Events whose
+  duration is unknown — name-search events, or XMLTV rows without a `stop`
+  time — use the per-job **Auto-record: duration (hours)** if set (you know
+  each sport's typical length: a rally stage ~1.5h, a boxing card ~4h),
+  otherwise the global *Generated event programme duration*. Priority:
+  real EPG span > per-job duration > global default. (Teamarr-watcher
+  recordings already used the EPG span.)
 - **De-duplication** keys on the **event's identity** (normalized title +
   `event_start`), checked across *all* auto-recordings regardless of channel —
   so duplicate provider feeds of one broadcast produce a single recording,
