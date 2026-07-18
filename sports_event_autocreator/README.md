@@ -227,6 +227,11 @@ unless you ask for it:
   creates the `Recording` row; Dispatcharr's own signal schedules the ffmpeg
   job. A start time already in the past but before the end still records the
   remainder.
+- **Recording length follows the EPG**: for EPG-matched events the recording
+  covers the programme's real start→end span (plus the pads). Only
+  name-search events — whose duration is unknown — fall back to the global
+  *Generated event programme duration* setting. (Teamarr-watcher recordings
+  already used the EPG span.)
 - **De-duplication** keys on the **event's identity** (normalized title +
   `event_start`), checked across *all* auto-recordings regardless of channel —
   so duplicate provider feeds of one broadcast produce a single recording,

@@ -10,10 +10,10 @@
       "author": "titooo7",
       "license": "MIT",
       "repo_url": "https://github.com/titooo7/dispatcharr-sports-event-autocreator",
-      "latest_version": "1.1.2",
-      "latest_url": "releases/sports_event_autocreator-1.1.2.zip",
-      "latest_sha256": "ee4b80d5127d127818b2372fe708c1dc261e0669f837c6293621b4b28cf4820c",
-      "latest_size": 66024,
+      "latest_version": "1.1.3",
+      "latest_url": "releases/sports_event_autocreator-1.1.3.zip",
+      "latest_sha256": "7e4fba0088d732ebf7eea849978ad1d94f1beac4cc385a6fa1112328792cd7e8",
+      "latest_size": 66474,
       "min_dispatcharr_version": "0.27.2",
       "last_updated": "2026-07-18T00:00:00Z"
     }

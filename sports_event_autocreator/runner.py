@@ -1137,7 +1137,10 @@ def load_epg_source_programmes(source_name: str, logger,
     from the database — Dispatcharr has already fetched and parsed the feed,
     and EPGData carries the original provider tvg_ids that match streams.
 
-    Returns a list of (epg_id, title, desc, start_utc_naive, source_name) tuples.
+    Returns a list of (epg_id, title, desc, start_utc_naive, source_name,
+    end_utc_naive_or_None) tuples — the end time feeds the auto-DVR feature
+    so recordings match the real programme duration instead of the global
+    default.
     """
     from apps.epg.models import EPGSource, ProgramData
 
@@ -1160,19 +1163,23 @@ def load_epg_source_programmes(source_name: str, logger,
     programmes = []
     qs = (ProgramData.objects.filter(epg__epg_source=src)
           .select_related("epg")
-          .only("title", "description", "start_time", "epg__tvg_id"))
+          .only("title", "description", "start_time", "end_time", "epg__tvg_id"))
     for p in qs.iterator(chunk_size=5000):
         start = p.start_time
         if start is None:
             continue
         if start.tzinfo is not None:
             start = start.astimezone(_tz.utc).replace(tzinfo=None)
+        end = p.end_time
+        if end is not None and end.tzinfo is not None:
+            end = end.astimezone(_tz.utc).replace(tzinfo=None)
         programmes.append((
             p.epg.tvg_id or "",
             (p.title or "").strip(),
             (p.description or "").strip(),
             start,
             src.name,
+            end,
         ))
     logger.info(f"Loaded {len(programmes)} programmes from EPG source '{src.name}'")
     if cache is not None:
@@ -1464,6 +1471,12 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
     elif job.today_only:
         target_date = now_local.date()
 
+    # Real programme duration (hours) per prepared channel display name, from
+    # the EPG end time. Auto-DVR uses it so an EPG-matched recording covers
+    # the actual programme instead of the fixed event_duration_hours default
+    # (name-search channels have no EPG end and keep the default).
+    record_duration_by_name = {}
+
     max_upcoming_date = None
     if job.upcoming:
         max_upcoming_date = now_local.date() + timedelta(days=job.days - 1)
@@ -1493,16 +1506,20 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                            (title_el.text or "").strip() if title_el is not None else "",
                            (desc_el.text or "").strip() if desc_el is not None else "",
                            programme.get("start", ""),  # parsed lazily after matching
-                           "xmltv")
+                           "xmltv",
+                           programme.get("stop", ""))   # parsed lazily, may be ""
 
             programmes = _iter_xmltv()
 
         logger.info(f"[{job.name}] PHASE 1: EPG-based search")
 
         programmes_by_event = defaultdict(set)  # (title, start_utc) -> {(epg_id, source)}
+        # (title, start_utc) -> latest known end_utc, for real-duration DVR
+        # windows. Max across sources: overruns hurt more than overshooting.
+        epg_end_by_event = {}
         epg_filtered_count = 0
 
-        for epg_id, title, desc, start_val, src_label in programmes:
+        for epg_id, title, desc, start_val, src_label, end_val in programmes:
             matches = False
             if not job.search:
                 matches = True
@@ -1549,6 +1566,12 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                         continue
 
                     programmes_by_event[(title, start_utc)].add((epg_id, src_label))
+                    end_utc = (end_val if isinstance(end_val, datetime)
+                               else engine.parse_xmltv_time(end_val or ""))
+                    if end_utc and end_utc > start_utc:
+                        prev = epg_end_by_event.get((title, start_utc))
+                        if prev is None or end_utc > prev:
+                            epg_end_by_event[(title, start_utc)] = end_utc
 
         if epg_filtered_count > 0:
             logger.info(f"[{job.name}] [EPG] Filtered out {epg_filtered_count} programmes by date/time")
@@ -1641,6 +1664,12 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                         break
 
             base_display_name = engine.format_epg_channel_name(title, start_utc, epg_country_flag)
+
+            event_end = epg_end_by_event.get((title, start_utc))
+            if event_end:
+                span_h = (event_end - start_utc).total_seconds() / 3600.0
+                if 0 < span_h <= 8:  # sanity: ignore absurd guide spans
+                    record_duration_by_name[base_display_name] = span_h
 
             # Deterministic (tvg_id, source) reference for EPG assignment
             ref_eid, ref_src = sorted(id_pairs)[0]
@@ -1949,8 +1978,9 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                                      display_name, reason):
             return
         try:
+            dur_hours = record_duration_by_name.get(display_name) or event_duration_hours
             created_rec = ensure_recording(
-                chan_id, sort_dt, event_duration_hours,
+                chan_id, sort_dt, dur_hours,
                 record_pre_pad_min, record_post_pad_min,
                 {"source": "sports-plugin", "job": job.name,
                  "program": {"title": display_name}}, logger,
