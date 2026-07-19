@@ -704,11 +704,18 @@ def build_name_channel_name(raw_stream_name: str,
     # 1. extract embedded datetime
     extracted_local_dt, is_specific_date, _found_weekday = extract_datetime_from_stream_name(raw_stream_name)
 
-    # 2. infer timezone
+    # 2. infer timezone — per-source priority, most specific first (same
+    # order as detect_flag_from_stream): the stream's own name outranks its
+    # group, which outranks the account. Scanning one concatenated blob let
+    # a generic group token beat the name's explicit country prefix purely
+    # by hint-table order (real case: stream "AU (STAN 03) | ..." in group
+    # "US | STAN PPV" got US Eastern instead of Australia — while the flag,
+    # correctly, showed 🇦🇺).
     group_name = stream.get("channel_group") or ""
     m3u_name = stream.get("m3u_account_name") or ""
-    search_text = f"{raw_stream_name} {group_name} {m3u_name}"
-    tz_result = infer_timezone_from_text(search_text)
+    tz_result = (infer_timezone_from_text(raw_stream_name)
+                 or infer_timezone_from_text(group_name)
+                 or infer_timezone_from_text(m3u_name))
 
     # 3. clean the name
     clean_name = clean_stream_name(raw_stream_name)
