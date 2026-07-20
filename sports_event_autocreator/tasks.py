@@ -2,8 +2,15 @@
 Celery task and beat-schedule management for the Sports Event Auto-Creator.
 
 The @shared_task below is registered when this module is imported. Dispatcharr
-imports enabled plugin modules both in the web workers (app ready) and in the
-Celery workers (worker_ready signal), so the task name resolves in both.
+imports enabled plugin modules in the web workers (app ready) and, per-process,
+in every Celery worker process — but WHICH signal triggers that varies by
+Dispatcharr version and, critically, only reliably covers `--pool=threads`
+workers (no parent/child split) or prefork CHILD processes, never a prefork
+ARBITER (the process that validates/dispatches incoming messages). Routing
+this task to the `dvr` queue (a `--pool=threads` worker on every standard
+Dispatcharr install) sidesteps that entirely — see the long comment further
+down, right above the STRATEGY_REFRESH_COMMAND/queue="dvr" combo, for the
+full story of why a plugin-side signal hook cannot fix the arbiter case.
 
 The user-selected run frequency (interval_minutes or cron_expression settings)
 is materialized as a django_celery_beat PeriodicTask that calls this task.
@@ -121,6 +128,45 @@ try:
 except Exception:
     logger.debug("Could not register %s control command", STRATEGY_REFRESH_COMMAND,
                  exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Dispatcharr >= 0.28.0: the ARBITER (prefork parent / consumer) process no
+# longer imports plugin modules at all. Discovery moved from `worker_ready`
+# (fires once, in the arbiter) to `worker_process_init` (fires per prefork
+# CHILD, deliberately skipping the parent so it never opens DB connections
+# autoscale children would inherit via fork — see dispatcharr/celery.py).
+#
+# For a `--pool=threads` worker (this Dispatcharr's `dvr` queue) there is no
+# separate child process, so that single process is both "arbiter" and
+# "worker" and gets the plugin import either way. But for a
+# `--pool=prefork --autoscale=...` worker (the `celery`/default queue this
+# task was previously routed to), the ARBITER (parent) process never imports
+# any plugin module at all, by design — only its prefork children do, on
+# their own worker_process_init. The arbiter is the process that actually
+# validates/dispatches every incoming message (children only execute work
+# already handed to them), so nothing a child does — and no signal hook a
+# plugin can add, since hooking a signal itself requires the module to
+# already be imported in that same process — can retroactively fix the
+# arbiter's registry. Confirmed by direct testing (Dispatcharr 0.28.0): the
+# arbiter's own `app.tasks` picks up a manually-triggered import fine, and
+# even an explicit `consumer.update_strategies()` call in that same process
+# doesn't help, because the fix can never actually run *in* the arbiter in
+# the first place — its own `worker_ready` fires before any plugin-supplied
+# signal handler could ever be connected there.
+#
+# Symptom without this fix: "Received unregistered task ... KeyError:
+# 'sports_event_autocreator.run_jobs'" from the arbiter's on_task_received,
+# and "pidbox command error: KeyError('sea_refresh_strategies')" for the
+# same reason — the arbiter's pidbox handler registry never gained the
+# control command above either.
+#
+# Fix: route this task to the `dvr` queue instead — the one queue guaranteed
+# to be served by a `--pool=threads` worker (no prefork parent/child split)
+# on every Dispatcharr install using the standard entrypoint. Trade-off:
+# job-creation runs share the dvr queue's thread pool with real recording
+# tasks; at the default `--concurrency=20` and typical run frequency this
+# is not a practical concern, but note it if that pool is ever narrowed.
 
 
 def _get_celery_app():
@@ -306,7 +352,7 @@ def _cleanup_orphans(old_interval, old_crontab):
 # The scheduled/queued task
 # ---------------------------------------------------------------------------
 
-@shared_task(name=TASK_NAME)
+@shared_task(name=TASK_NAME, queue="dvr")
 def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
     """
     Run all enabled jobs (or a single job when job_name is given).

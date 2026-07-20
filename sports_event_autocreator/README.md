@@ -244,6 +244,16 @@ unless you ask for it:
   plugin remembers (a tombstone in `auto_dvr_state.json` next to the plugin
   code) and will not re-create a recording for that same event — even while
   the event is still airing.
+
+The job-creation task itself runs on the `dvr` queue (not the default
+`celery` queue) — a deliberate choice, not a config default. Dispatcharr's
+default queue is served by a `--pool=prefork --autoscale` worker; on
+Dispatcharr ≥ 0.28.0 that worker's arbiter process never imports plugin
+modules at all (only its forked children do), so a task routed there is
+permanently unable to register — every "Run now" or scheduled run fails
+with "Received unregistered task". The `dvr` queue's `--pool=threads`
+worker has no such split. See the comment above `run_jobs_task`'s
+`@shared_task` decorator in `tasks.py` for the full story.
 - Name-search events whose timezone couldn't be reliably inferred are **not**
   recorded (a guessed start time would schedule the recording wrong).
 

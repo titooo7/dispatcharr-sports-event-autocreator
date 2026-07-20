@@ -1,6 +1,6 @@
 {
   "name": "Sports Event Auto-Creator",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "description": "Auto-creates event channels for sports (Boxing, Track Field, MotoGP and other sports, ...) from EPG and stream-name searches, with per-sport jobs edited in the UI and a configurable schedule.",
   "author": "titooo7",
   "fields": [
