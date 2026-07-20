@@ -17,17 +17,27 @@ ORM) — no URL, username or password needed.
    Alternatively zip the folder and use *Import Plugin* on the Plugins page.
 2. Open **Plugins** in the Dispatcharr UI, hit the refresh icon, and **enable**
    the plugin (accept the trust warning).
-3. **Restart the celery container once** after the first enable and after any
-   plugin update (`docker restart dispatcharr_celery`) so the workers import
-   the plugin's background task. The plugin then refreshes the workers'
-   task-dispatch tables automatically at boot and before every queued run,
-   and gracefully recycles prefork pool children forked before the plugin
-   import (both work around Dispatcharr importing plugins at `worker_ready`,
-   which is after
-   celery builds its dispatch table AND after the pool forks its first
-   children — otherwise runs are dropped with "Received unregistered task"
-   or fail with `NotRegistered` inside a pool child, even though
-   `inspect registered` lists the task).
+3. **Restart both the web AND celery containers once** after the first
+   enable and after any plugin update (`docker restart dispatcharr_web
+   dispatcharr_celery`) — restarting only one is not enough:
+   - `celery` needs it so the `dvr`-queue worker (see below) imports the
+     plugin's background task.
+   - `web` needs it too: the *"Run now"* / *"Dry run"* / *"Run one job"*
+     buttons queue the task from inside the web container's own long-lived
+     Django process, which only re-imports `tasks.py` on restart. Update
+     the files on disk without restarting web and those buttons keep
+     building messages from the stale, pre-update task definition —
+     `celery inspect registered` and the celery logs can look completely
+     healthy while this is happening, since the problem is entirely on the
+     sending side. If a run still fails with "Received unregistered task"
+     right after an update despite celery having been restarted, this is
+     almost always why.
+   The plugin's background task itself runs on the `dvr` queue specifically
+   (not the default `celery` queue) — a `--pool=threads` worker, which does
+   not have the prefork parent/child import gap that the default queue's
+   `--pool=prefork` worker has on Dispatcharr ≥ 0.28.0 (see the comment
+   above `run_jobs_task`'s `@shared_task` decorator in `tasks.py` for the
+   full story).
 4. On the plugin card, open **Settings**: every job has its own group of
    fields (search terms, group, numbering, filters). Set **Run every N
    minutes** (or a cron expression), press **Save**, then **Apply schedule**.
