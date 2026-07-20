@@ -17,8 +17,11 @@ Converted from the standalone CLI script
 import os
 
 # Importing tasks at module level registers the @shared_task with Celery in
-# every process that loads this plugin (web workers at app-ready, Celery
-# workers via the worker_ready hook). Do not remove.
+# every process that loads this plugin (web workers at app-ready; Celery
+# workers via whichever signal Dispatcharr's own core uses for that version —
+# see the long comment above run_jobs_task's @shared_task decorator in
+# tasks.py for why this task specifically is pinned to the dvr queue rather
+# than relying on that). Do not remove.
 from . import tasks
 from . import runner
 
@@ -325,7 +328,7 @@ def _touch_reload_token() -> None:
 
 class Plugin:
     name = "Sports Event Auto-Creator"
-    version = "1.1.7"
+    version = "1.1.8"
     description = (
         "Auto-creates event channels for sports (boxing, MotoGP, Tennis, ...) from "
         "EPG and stream-name searches, with per-sport jobs and a configurable schedule."
@@ -489,14 +492,10 @@ class Plugin:
                 except Exception:
                     logger.exception("Could not apply schedule (run continues)")
 
-            # Make sure the workers can actually dispatch our task (they may
-            # have built their dispatch table before the plugin was imported).
-            replies = tasks.broadcast_strategy_refresh(wait=True)
-            worker_ready = any(
-                isinstance(reply, dict) and "ok" in reply
-                for entry in (replies or []) if isinstance(entry, dict)
-                for reply in entry.values()
-            )
+            # Make sure at least one live worker actually knows this task
+            # (e.g. the dvr-queue worker hasn't finished booting yet right
+            # after a celery restart) before telling the user it's queued.
+            worker_ready = tasks.check_worker_ready()
 
             dry_run = action == "dry_run"
             tasks.run_jobs_task.delay(job_name=job_name, dry_run=dry_run)

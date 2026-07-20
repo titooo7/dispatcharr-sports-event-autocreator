@@ -8,9 +8,9 @@ Dispatcharr version and, critically, only reliably covers `--pool=threads`
 workers (no parent/child split) or prefork CHILD processes, never a prefork
 ARBITER (the process that validates/dispatches incoming messages). Routing
 this task to the `dvr` queue (a `--pool=threads` worker on every standard
-Dispatcharr install) sidesteps that entirely — see the long comment further
-down, right above the STRATEGY_REFRESH_COMMAND/queue="dvr" combo, for the
-full story of why a plugin-side signal hook cannot fix the arbiter case.
+Dispatcharr install) sidesteps that entirely — see the long comment above
+the `@shared_task(..., queue="dvr")` decorator further down for the full
+story of why a plugin-side signal hook cannot fix the arbiter case.
 
 The user-selected run frequency (interval_minutes or cron_expression settings)
 is materialized as a django_celery_beat PeriodicTask that calls this task.
@@ -66,70 +66,6 @@ logger = logging.getLogger(f"plugins.{PLUGIN_KEY}")
 # detected and skipped.
 # ---------------------------------------------------------------------------
 
-STRATEGY_REFRESH_COMMAND = "sea_refresh_strategies"
-
-# pids of pool children forked before this plugin module was imported (they
-# cannot execute the plugin task). Snapshotted on the first refresh after
-# import; shrinks as children get recycled, then stays empty.
-_stale_child_pids = None
-
-
-def _recycle_stale_children(state) -> None:
-    global _stale_child_pids
-    raw_pool = getattr(getattr(state.consumer, "pool", None), "_pool", None)
-    if raw_pool is None or not hasattr(raw_pool, "_worker_active"):
-        return  # threads/solo pool: tasks run in the (healed) main process
-    procs = [p for p in list(getattr(raw_pool, "_pool", []) or []) if p.pid]
-    if _stale_child_pids is None:
-        # First refresh runs right after the worker_ready import, so every
-        # child alive now was forked before the plugin existed in the parent.
-        _stale_child_pids = {p.pid for p in procs}
-    remaining = [p for p in procs if p.pid in _stale_child_pids]
-    _stale_child_pids &= {p.pid for p in remaining}  # forget already-exited pids
-    if not remaining:
-        return
-    recycled = set()
-    for proc in remaining:
-        try:
-            if raw_pool._worker_active(proc):
-                continue  # mid-task; picked up again on the next refresh
-            proc.terminate_controlled()
-            recycled.add(proc.pid)
-        except Exception:
-            logger.debug("Could not recycle pool child %s", proc.pid, exc_info=True)
-    _stale_child_pids -= recycled
-    if recycled:
-        logger.info(
-            "Recycled %d pre-plugin pool child(ren); replacements will register "
-            "the plugin task%s", len(recycled),
-            f" ({len(_stale_child_pids)} busy, retrying on next refresh)"
-            if _stale_child_pids else "")
-
-
-try:
-    from celery.worker.control import control_command
-
-    @control_command()
-    def sea_refresh_strategies(state):
-        """Rebuild the consumer's task-dispatch table so tasks registered
-        after consumer start (plugins imported at worker_ready) become
-        deliverable without a broker reconnect, and recycle pool children
-        forked before the plugin import (they can't run the task)."""
-        state.consumer.update_strategies()
-        logger.info("Task dispatch table refreshed (%s)", STRATEGY_REFRESH_COMMAND)
-        try:
-            _recycle_stale_children(state)
-        except Exception:
-            logger.warning(
-                "Could not recycle pre-plugin pool children — a run may still "
-                "hit one (NotRegistered); it heals on later refreshes or a "
-                "container restart", exc_info=True)
-        return {"ok": "strategies refreshed"}
-except Exception:
-    logger.debug("Could not register %s control command", STRATEGY_REFRESH_COMMAND,
-                 exc_info=True)
-
-
 # ---------------------------------------------------------------------------
 # Dispatcharr >= 0.28.0: the ARBITER (prefork parent / consumer) process no
 # longer imports plugin modules at all. Discovery moved from `worker_ready`
@@ -155,18 +91,25 @@ except Exception:
 # the first place — its own `worker_ready` fires before any plugin-supplied
 # signal handler could ever be connected there.
 #
-# Symptom without this fix: "Received unregistered task ... KeyError:
-# 'sports_event_autocreator.run_jobs'" from the arbiter's on_task_received,
-# and "pidbox command error: KeyError('sea_refresh_strategies')" for the
-# same reason — the arbiter's pidbox handler registry never gained the
-# control command above either.
-#
 # Fix: route this task to the `dvr` queue instead — the one queue guaranteed
 # to be served by a `--pool=threads` worker (no prefork parent/child split)
 # on every Dispatcharr install using the standard entrypoint. Trade-off:
 # job-creation runs share the dvr queue's thread pool with real recording
 # tasks; at the default `--concurrency=20` and typical run frequency this
 # is not a practical concern, but note it if that pool is ever narrowed.
+#
+# An earlier version of this file carried a custom `sea_refresh_strategies`
+# celery control command + a "recycle stale pool children" mechanism, to
+# heal prefork children forked before this module was imported (a real
+# problem when this task ran on the prefork `celery` queue). Removed: since
+# the task now runs exclusively on the thread-pool `dvr` queue, there is no
+# forking involved at all — no child process can ever be "stale" relative
+# to this task, on any Dispatcharr version. The custom command served no
+# remaining purpose but still got broadcast on every "Run now" click (see
+# `check_worker_ready()` below, which replaced it) and, since the `celery`
+# queue's arbiter can never have a custom command it never imported, that
+# broadcast reliably produced a harmless-but-alarming `KeyError('sea_
+# refresh_strategies')` in the logs on every single click.
 
 
 def _get_celery_app():
@@ -178,39 +121,26 @@ def _get_celery_app():
         return current_app
 
 
-def broadcast_strategy_refresh(wait: bool = False):
-    """
-    Ask all workers to rebuild their dispatch tables.
-    With wait=True, returns the list of worker replies (empty = no worker
-    answered, i.e. the workers don't know the command yet and need a restart).
+def check_worker_ready() -> bool:
+    """Whether at least one live celery worker knows about this task.
+
+    Uses celery's built-in `registered` inspect command — unlike a custom
+    control command, every worker (including a prefork arbiter that never
+    imported this plugin) always has a handler for it, so this can never
+    itself produce a "command error" the way probing for a custom command
+    can. Returns False (never raises) if nothing answers in time.
     """
     try:
         app = _get_celery_app()
-        if wait:
-            return app.control.broadcast(
-                STRATEGY_REFRESH_COMMAND, reply=True, timeout=2.0) or []
-        app.control.broadcast(STRATEGY_REFRESH_COMMAND)
-        return None
+        replies = app.control.inspect(timeout=2.0).registered() or {}
+        # Each entry is normally just the bare task name, but celery's
+        # `registered` command appends "[attr=val ...]" when the task has
+        # non-default exchange/routing_key/rate_limit — substring match to
+        # stay correct either way.
+        return any(TASK_NAME in entry for entries in replies.values() for entry in entries)
     except Exception:
-        logger.debug("Strategy-refresh broadcast failed", exc_info=True)
-        return [] if wait else None
-
-
-# NOTE: this file used to also self-heal unconditionally on every worker boot
-# (broadcast_strategy_refresh() called here at import time). Removed: since
-# run_jobs_task moved to the `dvr` queue (see the big comment above its
-# @shared_task decorator), it never runs on a prefork child, so there is no
-# more "stale forked child" state left for this broadcast to heal — and
-# broadcasting unconditionally on every import (i.e. every prefork child
-# fork/reload, not just once) only produced a `KeyError('sea_refresh_
-# strategies')` from the 'celery' queue's arbiter every single time, since
-# that process structurally never has the handler (see the same comment).
-# The explicit, user-triggered call in plugin.py's "Run now" handler
-# (`broadcast_strategy_refresh(wait=True)`, used for the worker-readiness
-# check shown in the UI) is unaffected and still fires — just once per
-# button press instead of on every fork, and its purpose (confirming the
-# `dvr` worker specifically is ready) is unrelated to the healing this one
-# used to attempt.
+        logger.debug("Worker-readiness check failed", exc_info=True)
+        return False
 
 
 def _write_last_run(payload: dict) -> None:
