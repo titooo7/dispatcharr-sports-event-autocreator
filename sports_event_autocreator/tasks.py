@@ -196,16 +196,21 @@ def broadcast_strategy_refresh(wait: bool = False):
         return [] if wait else None
 
 
-def _is_celery_worker_process() -> bool:
-    import sys
-    argv = " ".join(sys.argv)
-    return "celery" in argv and ("worker" in argv or "beat" in argv)
-
-
-# Self-heal on worker boot: this module is imported during worker_ready, so
-# queue the refresh now — the event loop starts right after and processes it.
-if _is_celery_worker_process():
-    broadcast_strategy_refresh()
+# NOTE: this file used to also self-heal unconditionally on every worker boot
+# (broadcast_strategy_refresh() called here at import time). Removed: since
+# run_jobs_task moved to the `dvr` queue (see the big comment above its
+# @shared_task decorator), it never runs on a prefork child, so there is no
+# more "stale forked child" state left for this broadcast to heal — and
+# broadcasting unconditionally on every import (i.e. every prefork child
+# fork/reload, not just once) only produced a `KeyError('sea_refresh_
+# strategies')` from the 'celery' queue's arbiter every single time, since
+# that process structurally never has the handler (see the same comment).
+# The explicit, user-triggered call in plugin.py's "Run now" handler
+# (`broadcast_strategy_refresh(wait=True)`, used for the worker-readiness
+# check shown in the UI) is unaffected and still fires — just once per
+# button press instead of on every fork, and its purpose (confirming the
+# `dvr` worker specifically is ready) is unrelated to the healing this one
+# used to attempt.
 
 
 def _write_last_run(payload: dict) -> None:
