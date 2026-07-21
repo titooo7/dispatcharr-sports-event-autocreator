@@ -12,6 +12,19 @@ Dispatcharr install) sidesteps that entirely — see the long comment above
 the `@shared_task(..., queue="dvr")` decorator further down for the full
 story of why a plugin-side signal hook cannot fix the arbiter case.
 
+Celery Beat itself never imports plugin modules at all (Dispatcharr's own
+apps.py skips discovery for any process with 'celery'/'beat' in argv), so
+Beat has no idea this task's decorator says queue="dvr" — it only routes by
+the PeriodicTask row's own `queue` field or the app's static task_routes,
+neither of which knew about this task otherwise. Without `queue="dvr"` set
+explicitly in sync_schedule()'s update_or_create() below, Beat silently
+dispatched every run to the default `celery` queue, which depends on the
+same fragile prefork-child registration described above — worked by luck of
+which autoscaled child got forked when, until it didn't (confirmed broken
+for ~17h straight after a routine celery container rebuild, 2026-07-20/21).
+Setting `queue="dvr"` on the PeriodicTask makes Beat route correctly no
+matter what any worker process has or hasn't registered.
+
 The user-selected run frequency (interval_minutes or cron_expression settings)
 is materialized as a django_celery_beat PeriodicTask that calls this task.
 """
@@ -225,7 +238,7 @@ def sync_schedule(settings: dict) -> str:
         PeriodicTask.objects.update_or_create(
             name=PERIODIC_TASK_NAME,
             defaults={"task": TASK_NAME, "crontab": crontab, "interval": None,
-                      "enabled": True, "kwargs": "{}"},
+                      "enabled": True, "kwargs": "{}", "queue": "dvr"},
         )
     elif minutes > 0:
         interval, _ = IntervalSchedule.objects.get_or_create(
@@ -234,7 +247,7 @@ def sync_schedule(settings: dict) -> str:
         PeriodicTask.objects.update_or_create(
             name=PERIODIC_TASK_NAME,
             defaults={"task": TASK_NAME, "interval": interval, "crontab": None,
-                      "enabled": True, "kwargs": "{}"},
+                      "enabled": True, "kwargs": "{}", "queue": "dvr"},
         )
     else:
         # Disabled: keep the row but switch it off so beat stops firing.
