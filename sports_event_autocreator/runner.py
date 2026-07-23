@@ -47,6 +47,7 @@ JOB_DEFAULTS = {
     "epg_sources": [],          # names of Dispatcharr EPG sources (win over xmltv_url)
     "xmltv_url": "",            # optional; Phase 1 skipped when both are empty
     "search": [],               # list of search terms
+    "name_search": True,        # also use "search" terms for Phase 2 stream-name matching
     "exclude": [],              # list of exclusion terms
     "exclude_stream_prefixes": [],  # drop EPG-match streams whose name starts with these
     "search_descriptions": True,  # also match terms in EPG programme descriptions
@@ -179,6 +180,11 @@ JOB_FIELD_SPECS = [
      "search phase. Fetched once per run even if several jobs share it."),
     ("search",           "lines",   "Search terms (one per line)",
      "EPG phase matches whole words in programme title/description; name phase matches substrings in stream names."),
+    ("name_search",      "boolean", "Also use these terms for name-based search (Phase 2)",
+     "Untick to keep using these terms for the EPG phase only and skip Phase 2 "
+     "entirely for this job. Useful when another tool (e.g. Teamarr) already "
+     "covers name-based matching for this sport better than a generic "
+     "substring search would."),
     ("exclude",          "lines",   "Exclude terms (one per line)",
      "Whole-word exclusions applied to programmes, stream names and cleanup."),
     ("exclude_stream_prefixes", "lines", "Exclude stream-name prefixes (EPG matches, one per line)",
@@ -1704,7 +1710,9 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
     # above. Name-based streams are treated as "current" (their embedded times
     # are often relative/unreliable), so _passes_time_filters intentionally
     # checks only target_date/future_only/max_past_hours/max_future_hours.
-    if job.search:
+    if job.search and not job.name_search:
+        logger.info(f"[{job.name}] PHASE 2: skipped (name-based search disabled for this job)")
+    if job.search and job.name_search:
         logger.info(f"[{job.name}] PHASE 2: name-based search (with timezone inference)")
         found_streams_by_id: Dict[int, Dict] = {}
         for term in job.search:
