@@ -54,7 +54,9 @@ ORM) — no URL, username or password needed.
 | Recording pre-roll padding (minutes) | Start each auto-recording this many minutes before the event start (default `5`). |
 | Recording post-roll padding (minutes) | Keep recording this many minutes past the event's scheduled end (default `30`). |
 | Replay retention (days) | Delete auto-created recordings older than this (files + rows); `0` disables age-based deletion (default `14`). Failed/zero-byte auto-recordings are always cleaned after 1 day. Manual recordings are never touched. |
-| Max simultaneous recordings (0 = unlimited) | Caps how many recordings (any origin) may be airing at once (default `2`) — distinct events can overlap and the provider's concurrent-stream budget is finite. Duplicate feeds of one broadcast are already deduplicated by event identity, so this only gates different events. Dead rows (interrupted/failed/stopped/completed) don't occupy a slot. Extras beyond the cap are skipped and logged, not queued. |
+| Max simultaneous recordings (0 = unlimited) | Caps how many recordings (any origin) may be airing at once (default `2`) — distinct events can overlap and the provider's concurrent-stream budget is finite. Duplicate feeds of one broadcast are already deduplicated by event identity, so this only gates different events. Dead rows (interrupted/failed/stopped/completed) don't occupy a slot. Extras beyond the cap are skipped, logged, and counted in the run summary (`N capped`) — retried automatically on the next run. |
+| Teamarr watcher: time-shift tolerance (hours, 0 = disable) | Used by the Teamarr watcher only — each job has its own separate setting of the same name for the keyword-EPG path (see *Auto-DVR / Replays* below), not a fallback/inheritance relationship. Default `3`. |
+| Teamarr watcher: max extension (hours, 0 = uncapped) | Used by the Teamarr watcher only — same relationship to the per-job setting as above. Default `2`. |
 | Teamarr watcher: channel groups / title patterns / exclude patterns | Optional watcher that auto-records Teamarr event channels (see *Auto-DVR / Replays* below). Empty groups or empty patterns = off. |
 | Job name for 'Run one job' | Which job the *Run one job* button runs. |
 | Job names | Comma-separated list of jobs; drives which per-job field groups exist. |
@@ -73,7 +75,8 @@ flag mapping:
 | --- | --- | --- |
 | Enabled | — | Untick to skip the job without losing its settings. |
 | Channel group | `--group` | Required. Created automatically if missing. |
-| Search EPG source: … | — | One checkbox per active EPG source from **M3U & EPG Manager**; tick one or several and their programmes are searched together. Data is read from Dispatcharr's database (already fetched and parsed — no extra download) and carries the provider `tvg-id`s that match streams. Takes precedence over the XMLTV URL. In exported JSON this is the `"epg_sources"` list (the old `"epg_source"` string is still accepted on import). Newly added sources appear after **Reload job fields** + page refresh. |
+| Search all EPG sources | — | When on, searches every currently-active EPG source automatically and ignores the checkboxes below entirely — so a source added *after* this job was last configured is covered without you having to come back and tick it. Defaults to **off** for any job that already has its per-source checkboxes saved (keeps exactly what's configured, no surprise widening), and **on** for a job that's never had them saved. |
+| Search EPG source: … | — | One checkbox per active EPG source from **M3U & EPG Manager**; tick one or several and their programmes are searched together. Ignored while *Search all EPG sources* (above) is on. Data is read from Dispatcharr's database (already fetched and parsed — no extra download) and carries the provider `tvg-id`s that match streams. Takes precedence over the XMLTV URL. In exported JSON this is the `"epg_sources"` list (the old `"epg_source"` string is still accepted on import). Newly added sources appear after **Reload job fields** + page refresh. |
 | XMLTV URL | `--xmltv` | Optional. External XMLTV URL (or a file path under `/data`) for the EPG phase. Fetched once per run even if several jobs share it. |
 | Search terms | `--search` | EPG phase matches whole words in title/description; name phase matches substrings in stream names. |
 | Also use these terms for name-based search (Phase 2) | — | On by default. Untick to keep this job's EPG phase as-is and skip Phase 2 (stream-name search) entirely — useful when another tool (e.g. Teamarr) already covers name-search event creation better for a given sport. |
@@ -106,8 +109,10 @@ the box is the closest equivalent):
 - To **export**: press **Export jobs JSON**, refresh the page (without
   pressing Save first), open Settings and copy the JSON from the box. The
   same JSON is also written to
-  `data/plugins/sports_event_autocreator/jobs.export.json` (shown in the
-  action's `Output:` line).
+  `data/plugins/.plugin_state/sports_event_autocreator/jobs.export.json`
+  (shown in the action's `Output:` line) — this directory survives a plugin
+  update (see *Auto-DVR / Replays* below), unlike the plugin's own code
+  directory.
 - To **import**: paste the JSON array into the box, press **Save**, press
   **Import jobs JSON** (confirm), then refresh the page **without pressing
   Save again** (the still-open form holds the old values and would overwrite
@@ -246,15 +251,39 @@ unless you ask for it:
   otherwise the global *Generated event programme duration*. Priority:
   real EPG span > per-job duration > global default. (Teamarr-watcher
   recordings already used the EPG span.)
-- **De-duplication** keys on the **event's identity** (normalized title +
-  `event_start`), checked across *all* auto-recordings regardless of channel —
-  so duplicate provider feeds of one broadcast produce a single recording,
-  purge/recreate cycles (which give channels fresh ids every run) don't
-  double-book, and changing the padding never does either.
+- **Recordings extend when a game runs long**: if a later run sees a
+  longer real EPG span for a recording already created (extra time, a
+  rain delay, a broadcast running over), its `end_time` is extended —
+  whether the recording is still pending or already capturing (Dispatcharr's
+  own recording task re-reads `end_time` from the database every ~2 seconds
+  and adjusts its stop point live). Capped at the per-job **Auto-record:
+  max extension (hours)** past the *original* end (default `2`, `0` =
+  uncapped), so a bad EPG value can't schedule a runaway-length capture.
+- **A broadcaster moving an event's start time reschedules the existing
+  recording** instead of creating a duplicate or missing it — as long as the
+  shift is within the per-job **Auto-record: time-shift tolerance (hours)**
+  (default `3`, `0` disables this and reverts to the old exact-time-match
+  behavior, where a shifted event creates a second recording). If the
+  original recording is already capturing by the time the shift is noticed,
+  it is never interrupted — it's left running (and extended if the new EPG
+  end is later), and a second recording is created for the new time as a
+  backup, logged clearly since this uses two concurrency-cap slots for one
+  event.
+- **De-duplication** keys on the event's identity — the **raw, underlying**
+  title (not the formatted display name) plus `event_start` — checked across
+  *all* auto-recordings regardless of channel, so duplicate provider feeds of
+  one broadcast produce a single recording, purge/recreate cycles (which
+  give channels fresh ids every run) don't double-book, changing the padding
+  never does either, and per-job display toggles (*country flags*, *no
+  region label*) can't accidentally break dedup between two jobs or two runs
+  of the same job, since they only affect the cosmetic name, never the
+  identity used here.
 - **User deletions stick**: if you delete an auto-created recording, the
-  plugin remembers (a tombstone in `auto_dvr_state.json` next to the plugin
-  code) and will not re-create a recording for that same event — even while
-  the event is still airing.
+  plugin remembers (a tombstone in
+  `data/plugins/.plugin_state/sports_event_autocreator/auto_dvr_state.json`,
+  a location the plugin-update process never touches, unlike the plugin's
+  own code directory) and will not re-create a recording for that same
+  event — even while the event is still airing.
 
 The job-creation task itself runs on the `dvr` queue (not the default
 `celery` queue) — a deliberate choice, not a config default. Dispatcharr's
@@ -302,7 +331,15 @@ scheduled/ending in the future — it defers that deletion to a later run.
   re-enabling, press **Apply schedule** (or **Run now**) to switch the
   schedule back on.
 - **Show status** reports the beat schedule state, when it last dispatched,
-  and the last actual run result — use it first whenever "nothing happens".
+  the last actual run result, and — separately — when the plugin last
+  *actually succeeded* (a skipped/overlapping run or a dry run never
+  overwrites that, so it stays trustworthy even after one). A run that
+  crashes outside the normal per-job error handling is reported as its own
+  distinct status rather than silently leaving the previous result showing.
+  The run summary also reports how many EPG programmes were scanned and
+  matched, so a dead/stale EPG source (0 scanned) doesn't look the same as
+  a genuinely quiet week (thousands scanned, still 0 matches) — use it
+  first whenever "nothing happens".
 - Deletion safety is the same as the script: `purge_group` respects
   `preserve_below`; `purge_unmatched` only deletes channels whose streams are
   also unmatched, or whose streams were re-used by a newer event.
