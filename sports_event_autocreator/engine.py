@@ -760,13 +760,20 @@ def build_name_channel_name(raw_stream_name: str,
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+# The date-prefix produced by format_epg_channel_name/build_name_channel_name
+# for a specific-date event: "HH:MM, D-Mon | Title". Named/exported so the
+# channel-ownership adoption heuristic (runner.py) can recognize a
+# plugin-generated channel name without duplicating this pattern.
+GENERATED_NAME_DATE_RE = re.compile(r'(\d{2}):(\d{2}),\s+(\d{1,2})-([A-Za-z]{3})')
+
+
 def is_channel_too_old(name: str, max_hours: float) -> bool:
     """
     Parse the timestamp from a channel name (e.g. '16:40, 13-Mar | Title')
     and check if it is older than max_hours.
     """
     try:
-        match = re.search(r'(\d{2}):(\d{2}),\s+(\d{1,2})-([A-Za-z]{3})', name)
+        match = GENERATED_NAME_DATE_RE.search(name)
         if not match:
             return False
 
@@ -1043,3 +1050,240 @@ def pick_error_line(ffmpeg_stderr: str, max_len: int = 160) -> str:
         if _FFMPEG_ERROR_LINE_RE.search(ln):
             return ln[:max_len]
     return lines[-1][:max_len] if lines else ""
+
+
+# ---------------------------------------------------------------------------
+# Channel numbering (v1.3.0)
+#
+# Dispatcharr's own build_reserved_set() (apps/channels/compact_numbering.py)
+# reserves BOTH Channel.channel_number and ChannelOverride.channel_number
+# instance-wide -- NumberAllocator mirrors that exactly. Numbers are floats
+# throughout Dispatcharr, so every number is normalized through float() on
+# the way in/out (260 and 260.0 must be treated identically).
+# ---------------------------------------------------------------------------
+
+class NumberAllocator:
+    """Pure channel-number allocator, no I/O.
+
+    ``used``: every channel_number/ChannelOverride.channel_number currently
+    in the DB (instance-wide -- Dispatcharr enforces number uniqueness
+    instance-wide, not just per-group).
+    ``blocked_ranges``: (lo, hi, owner_job_name) for every OTHER enabled
+    job's configured numbering span -- a number inside one of these is off
+    limits to any job that doesn't own that range. ``hi`` may be None for an
+    unbounded (highest-start, no end_number) job.
+    """
+
+    def __init__(self, used, blocked_ranges):
+        self._used = {self._norm(n) for n in used if n is not None}
+        self._blocked = [(self._norm(lo), (self._norm(hi) if hi is not None else None), owner)
+                         for lo, hi, owner in (blocked_ranges or [])]
+
+    @staticmethod
+    def _norm(n) -> float:
+        return float(n)
+
+    def release(self, number) -> None:
+        if number is None:
+            return
+        self._used.discard(self._norm(number))
+
+    def reserve(self, number) -> None:
+        if number is None:
+            return
+        self._used.add(self._norm(number))
+
+    def _blocked_for(self, n: float, requesting_job: str) -> bool:
+        for lo, hi, owner in self._blocked:
+            if owner == requesting_job:
+                continue  # a job's own span never blocks itself
+            if n >= lo and (hi is None or n <= hi):
+                return True
+        return False
+
+    # Hard cap on candidate numbers checked per next_free() call, independent
+    # of ``end`` (which may be None/unbounded, e.g. two jobs tied on the same
+    # start_number with no end_number -- see compute_job_number_spans). No
+    # real Dispatcharr instance has anywhere near this many channel numbers
+    # in a single job's realistic range, so this can never fire in normal
+    # use -- it exists purely so a misconfigured/unbounded span can never
+    # hang the allocator (and, via the run-lock's finally, every future
+    # scheduled run) instead of returning an error.
+    _MAX_CANDIDATES = 100_000
+
+    def next_free(self, cursor, end, requesting_job: str):
+        """Walk upward from ``cursor`` (inclusive) for the next number that is
+        neither used nor inside another job's blocked range. Returns
+        ``(number, reason)`` on success (``reason`` starts with "skipped "
+        when one or more occupied/blocked numbers had to be stepped over,
+        else "ok"), or ``(None, reason)`` if `end` is reached first (`end`
+        may be None for an unbounded search, in which case exhaustion never
+        happens) OR the search bound (see ``_MAX_CANDIDATES``) is reached
+        first -- this guarantees the call always terminates, regardless of
+        how ``end`` or the blocked ranges are configured. Does NOT reserve
+        the returned number -- the caller reserves explicitly only after
+        actually creating the channel.
+        """
+        if cursor is None:
+            return None, "no starting cursor"
+        n = self._norm(cursor)
+        end_n = self._norm(end) if end is not None else None
+        skipped = []
+        checked = 0
+        while end_n is None or n <= end_n:
+            if checked >= self._MAX_CANDIDATES:
+                return None, ("exhausted search bound without finding a free "
+                               f"number (checked {checked} candidates from {cursor})")
+            checked += 1
+            if n in self._used or self._blocked_for(n, requesting_job):
+                skipped.append(n)
+                n += 1.0
+                continue
+            if skipped:
+                return n, f"skipped {len(skipped)} occupied/blocked number(s): {skipped}"
+            return n, "ok"
+        return None, f"range exhausted (no free number <= {end_n})"
+
+
+def decide_channel_purge(ch: dict, owner, job_name: str, known_job_names: set,
+                         is_preserved: bool):
+    """Pure ownership/purge policy. Returns (delete_eligible, reason).
+
+    ``is_preserved`` wins over everything (never delete). An unowned channel
+    (no registry entry) is never deleted -- protects manual channels and,
+    pre-adoption, everything the plugin already made. A channel owned by
+    another currently-configured job (enabled or not) is never touched by
+    this job. A channel owned by a job name that no longer exists in the
+    config is delete-eligible AND flagged for adoption into the current job
+    (the reason string names it) -- the caller still applies its own
+    purge_group/purge_unmatched/cleanup rules on top of "delete-eligible".
+    """
+    if is_preserved:
+        return False, "preserved"
+    if owner is None:
+        return False, "unowned, protected"
+    if owner == job_name:
+        return True, "owned by this job"
+    if owner in known_job_names:
+        return False, f"owned by job '{owner}'"
+    return True, f"adopting from removed job '{owner}'"
+
+
+def _channel_disambiguation_score(desired: dict, candidate: dict) -> int:
+    """Lower is a better match: exact stream-set match, then any shared
+    stream id, then equal slot index, else no particular preference."""
+    desired_ids = set(desired.get("stream_ids") or [])
+    cand_ids = set(candidate.get("stream_ids") or [])
+    if desired_ids and cand_ids and desired_ids == cand_ids:
+        return 0
+    if desired_ids & cand_ids:
+        return 1
+    if desired.get("slot") is not None and candidate.get("slot") == desired.get("slot"):
+        return 2
+    return 3
+
+
+def decide_channel_action(desired: dict, owned_candidates: list, shift_tolerance_hours: float):
+    """Pure update-in-place matching decision (Phase 1 only).
+
+    ``desired``: {title_norm, event_iso, event_dt, stream_ids, slot}.
+    ``owned_candidates``: this job's owned channels in the target group, each
+    a dict of the same shape plus channel_id. The caller is responsible for
+    removing a candidate from this list once it has been claimed by an
+    earlier ``desired`` entry in the same pass, so no candidate is ever
+    claimed twice.
+
+    Returns (action, target_channel_id_or_None, reason) where action is
+    "update" or "create". Priority: (1) exact title_norm+event_iso match
+    (disambiguated by stream-set/shared-id/slot when several candidates tie
+    on title+time -- split-mode); (2) same title_norm within
+    shift_tolerance_hours of event_dt, nearest wins (ties broken the same
+    way); (3) create.
+    """
+    exact = [c for c in owned_candidates
+             if c.get("title_norm") == desired.get("title_norm")
+             and c.get("event_iso") == desired.get("event_iso")]
+    if exact:
+        best = min(exact, key=lambda c: _channel_disambiguation_score(desired, c))
+        return "update", best["channel_id"], "exact identity match"
+
+    if shift_tolerance_hours and shift_tolerance_hours > 0:
+        tol_seconds = shift_tolerance_hours * 3600
+        candidates = [
+            c for c in owned_candidates
+            if c.get("title_norm") == desired.get("title_norm")
+            and c.get("event_dt") is not None and desired.get("event_dt") is not None
+            and abs((c["event_dt"] - desired["event_dt"]).total_seconds()) <= tol_seconds
+        ]
+        if candidates:
+            best = min(candidates, key=lambda c: (
+                abs((c["event_dt"] - desired["event_dt"]).total_seconds()),
+                _channel_disambiguation_score(desired, c)))
+            return "update", best["channel_id"], "event time shifted within tolerance"
+
+    return "create", None, "no match"
+
+
+def epg_link_is_trustworthy(candidate_programmes: list, identity_title: str,
+                            sort_dt, tolerance_minutes: float):
+    """Phase 2 EPG corroboration (Issue 4a). Returns (trustworthy, reason).
+
+    ``candidate_programmes``: list of {"start_time": datetime, "title": str}
+    already fetched by the caller from ProgramData near sort_dt. Trustworthy
+    only when BOTH a start-time match within tolerance_minutes of sort_dt AND
+    a title match are found on the SAME programme -- either alone is not
+    enough (a provider's self-reported tvg_id on a name-search stream is
+    otherwise likely to resolve to its generic 24/7 channel guide, which
+    would attach a totally unrelated full-day programme purely because the
+    times happen to line up).
+    """
+    if not candidate_programmes:
+        return False, "no programmes found near the event time"
+    if sort_dt is None:
+        return False, "no reliable event time to corroborate against"
+
+    tolerance = timedelta(minutes=tolerance_minutes)
+    best_reason = "no programme within the time tolerance"
+    for p in candidate_programmes:
+        start = p.get("start_time")
+        if start is None:
+            continue
+        try:
+            within_time = abs(start - sort_dt) <= tolerance
+        except TypeError:
+            continue
+        if not within_time:
+            continue
+        cand_title = p.get("title") or ""
+        if not cand_title:
+            best_reason = "time matched but the programme has no title to corroborate"
+            continue
+        title_ok = (normalize_event_title(identity_title) == normalize_event_title(cand_title)
+                   or contains_normalized(identity_title, cand_title)
+                   or contains_normalized(cand_title, identity_title))
+        if title_ok:
+            return True, "time and title corroborated"
+        best_reason = f"time matched but title did not corroborate (programme title: '{cand_title}')"
+    return False, best_reason
+
+
+def probe_budget_plan(total: int, job_names: list):
+    """Per-job black-screen probe budget with a shared surplus pool.
+
+    Returns (per_job_plan, surplus) where per_job_plan is
+    {job_name: {"reserve": int, "used": 0, "warned": False}} and surplus is
+    the leftover from integer division, spent first-come by any job whose
+    own reserve runs out. total<=0 disables probing (every reserve is 0).
+    Handles an empty job_names list (no division by zero) and a single job
+    (reserve = total, no surplus).
+    """
+    total = max(int(total), 0)
+    plan = {name: {"reserve": 0, "used": 0, "warned": False} for name in job_names}
+    n = len(job_names)
+    if n == 0:
+        return plan, total
+    reserve = total // n
+    surplus = total - reserve * n
+    for name in job_names:
+        plan[name]["reserve"] = reserve
+    return plan, surplus

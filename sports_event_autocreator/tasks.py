@@ -422,6 +422,31 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
         logger.info("Starting %s of %d job(s): %s", mode, len(jobs),
                     ", ".join(j.name for j in jobs))
 
+        # Pre-flight numbering/purge warnings (Issue 1) -- never hard errors
+        # (an existing working config must not start failing runs over a new
+        # warning), visible in the log and folded into the run summary.
+        # known_job_names is every CONFIGURED job name (enabled or not), so a
+        # disabled job's channels are never mistaken for orphaned by the
+        # ownership pass. Wrapped defensively: this is advisory only and must
+        # never block a real run.
+        try:
+            all_configured_jobs, _ = runner.jobs_from_settings(settings)
+            known_job_names = {j.name for j in all_configured_jobs}
+        except Exception:
+            logger.exception("Could not resolve configured job names")
+            all_configured_jobs = jobs
+            known_job_names = {j.name for j in jobs}
+        # Validated against every configured job (not the possibly
+        # job_name-narrowed ``jobs``) so a "Run one job" invocation still
+        # surfaces overlap/tie warnings against jobs not part of this run.
+        try:
+            config_warnings = runner.validate_job_number_ranges(all_configured_jobs)
+        except Exception:
+            logger.exception("Numbering/purge pre-flight validation failed")
+            config_warnings = []
+        for w in config_warnings:
+            logger.warning("[CONFIG] %s", w)
+
         assign_epg = bool(settings.get("assign_epg", True))
         use_stream_logo = bool(settings.get("use_stream_logo", True))
         try:
@@ -436,14 +461,28 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
         except (TypeError, ValueError):
             black_sample_seconds = 5.0
         black_sample_seconds = max(3.0, min(30.0, black_sample_seconds))
+
+        try:
+            black_probe_budget = int(float(settings.get("black_probe_budget") or 80))
+        except (TypeError, ValueError):
+            black_probe_budget = 80
+        enabled_black_job_names = [j.name for j in jobs if getattr(j, "check_black", False)]
+        probe_plan, probe_surplus = engine.probe_budget_plan(black_probe_budget, enabled_black_job_names)
         # Shared across every event AND job in this run: caches probe verdicts
-        # by stream id and caps how many ffmpeg probes the run performs.
+        # by stream id, and spends per-job reserves + a shared surplus pool
+        # (see engine.probe_budget_plan / runner._select_unblack_streams).
         probe_state = {
             "cache": {},
-            "budget": 40,
             "sample_seconds": black_sample_seconds,
             "ffmpeg_missing_logged": False,
+            "plan": probe_plan,
+            "surplus": {"remaining": probe_surplus},
         }
+
+        try:
+            epg_link_tolerance_minutes = float(settings.get("epg_link_tolerance_minutes") or 90)
+        except (TypeError, ValueError):
+            epg_link_tolerance_minutes = 90.0
 
         # Auto-DVR (Replays) settings.
         def _num(key, default):
@@ -465,7 +504,11 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
         totals = {"prepared": 0, "created": 0, "deleted": 0,
                   "skipped": 0, "preserved": 0, "errors": 0, "recorded": 0,
                   "capped": 0, "extended": 0, "rescheduled": 0,
-                  "epg_scanned": 0, "epg_matched": 0}
+                  "epg_scanned": 0, "epg_matched": 0,
+                  "probes": 0, "probe_capped": 0,
+                  "unnumbered": 0, "number_conflicts": 0,
+                  "unowned_kept": 0, "adopted": 0,
+                  "updated": 0, "update_deferred": 0}
         per_job = {}
 
         # One auto-DVR index snapshot for the whole run (not one per job) --
@@ -474,6 +517,40 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
         # teamarr watcher) so two matches for the same event within this one
         # run still dedup against each other.
         dvr_index = runner.load_auto_dvr_index(runner._recording_model())
+
+        # One instance-wide channel-number index for the whole run (Issue 1)
+        # -- mutated in place across jobs so job B sees job A's freshly
+        # created numbers within the same run.
+        try:
+            number_index = runner.load_channel_number_index()
+        except Exception:
+            logger.exception("Could not load the channel-number index; numbering "
+                             "allocator starts empty this run")
+            number_index = set()
+        # Spans must always be computed from every ENABLED, currently-configured
+        # job -- never from the (possibly job_name-narrowed) ``jobs`` list --
+        # so a "Run one job" invocation still sees every other enabled job's
+        # range as a blocked range, exactly as a full run would. Mirrors the
+        # known_job_names pattern above (re-read via jobs_from_settings).
+        try:
+            job_spans = runner.compute_job_number_spans(
+                [j for j in all_configured_jobs if j.enabled])
+        except Exception:
+            logger.exception("Could not compute job number spans")
+            job_spans = {}
+        blocked_ranges = [(name, lo, hi) for name, (lo, hi) in job_spans.items()]
+
+        # One channel-ownership registry for the whole run (Issue 2) --
+        # mutated in place and saved by run_job after each job completes, and
+        # a per-run set coordinating the one-shot-per-group adoption pass
+        # (never persisted).
+        try:
+            channel_registry = runner.load_channel_registry(logger)
+        except Exception:
+            logger.exception("Could not load the channel registry; ownership "
+                             "tracking is disabled this run")
+            channel_registry = None
+        adoption_state: set = set()
 
         for job in jobs:
             try:
@@ -485,7 +562,14 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
                                        record_pre_pad_min=record_pre_pad_min,
                                        record_post_pad_min=record_post_pad_min,
                                        max_simultaneous_recordings=max_simultaneous_recordings,
-                                       dvr_index=dvr_index)
+                                       dvr_index=dvr_index,
+                                       number_index=number_index,
+                                       blocked_ranges=blocked_ranges,
+                                       job_number_end=job_spans.get(job.name, (None, None))[1],
+                                       channel_registry=channel_registry,
+                                       known_job_names=known_job_names,
+                                       adoption_state=adoption_state,
+                                       epg_link_tolerance_minutes=epg_link_tolerance_minutes)
                 per_job[job.name] = stats
                 for k in totals:
                     totals[k] += stats.get(k, 0)
@@ -533,6 +617,20 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
                 runner.prune_dvr_tombstones(logger)
             except Exception:
                 logger.exception("Tombstone pruning failed")
+            if channel_registry is not None:
+                try:
+                    from apps.channels.models import Channel
+                    existing_ids = set(Channel.objects.values_list("id", flat=True))
+                    runner.prune_channel_registry(channel_registry, existing_ids, logger)
+                    runner.save_channel_registry(channel_registry, logger)
+                except Exception:
+                    logger.exception("Channel registry pruning failed")
+
+        updated_clause = ""
+        if totals['updated'] or totals['update_deferred']:
+            updated_clause = f", {totals['updated']} updated in place"
+            if totals['update_deferred']:
+                updated_clause += f" ({totals['update_deferred']} stream-swap deferred)"
 
         prefix = "[DRY RUN] " if dry_run else ""
         summary = (f"{prefix}Sports Auto-Creator: {totals['created']} created, "
@@ -545,9 +643,23 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
                    f"{totals['epg_matched']} matched"
                    + (f", {retention_stats['deleted']} recording(s) pruned"
                       if retention_stats and retention_stats.get("deleted") else "")
+                   + (f", {totals['probes']} black-screen probe(s) "
+                      f"({totals['probe_capped']} capped)"
+                      if totals['probes'] or totals['probe_capped'] else "")
+                   + (f", {totals['unnumbered']} unnumbered"
+                      if totals['unnumbered'] else "")
+                   + (f", {totals['number_conflicts']} number conflict(s) resolved"
+                      if totals['number_conflicts'] else "")
+                   + (f", {totals['adopted']} channel(s) adopted"
+                      if totals['adopted'] else "")
+                   + (f", {totals['unowned_kept']} unowned channel(s) kept"
+                      if totals['unowned_kept'] else "")
+                   + updated_clause
                    + (f" — {totals['errors']} error(s)" if totals['errors'] else "")
                    + (f" — {len(config_errors)} misconfigured job(s) skipped"
-                      if config_errors else ""))
+                      if config_errors else "")
+                   + (f" — {len(config_warnings)} configuration warning(s)"
+                      if config_warnings else ""))
         logger.info(summary)
         run_success = totals["errors"] == 0 and not config_errors
         _notify(summary, success=run_success,

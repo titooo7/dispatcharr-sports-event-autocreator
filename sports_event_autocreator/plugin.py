@@ -97,6 +97,39 @@ GLOBAL_FIELDS = [
         ),
     },
     {
+        "id": "black_probe_budget",
+        "label": "Black-screen probe budget (per run)",
+        "type": "number",
+        "default": 80,
+        "help_text": (
+            "Total ffmpeg probes allowed per run, split EVENLY as a guaranteed "
+            "reserve across every job with 'Skip black-screen streams' enabled "
+            "— e.g. 80 across 8 such jobs guarantees 10 each — with any leftover "
+            "pooled as first-come shared surplus. Before this setting, the "
+            "budget was a single flat pool spent job-by-job in order, so the "
+            "LAST job(s) in a run could see it already exhausted by earlier "
+            "jobs and get zero probes. Once a job's own reserve (plus whatever "
+            "surplus remains) runs out, its remaining candidates are kept "
+            "unprobed for that job only (never blocking other jobs)."
+        ),
+    },
+    {
+        "id": "epg_link_tolerance_minutes",
+        "label": "EPG link corroboration tolerance (minutes)",
+        "type": "number",
+        "default": 90,
+        "help_text": (
+            "Phase 2 (name-search) channels whose stream carries a tvg_id are "
+            "linked to that tvg_id's real EPG data ONLY when a programme is "
+            "found within this many minutes of the parsed event time AND its "
+            "title also matches — either alone is not enough (a provider's "
+            "self-reported tvg_id is otherwise likely to be its generic 24/7 "
+            "channel id, which would attach an unrelated full-day guide). "
+            "Uncorroborated hits fall back to today's generated single-event "
+            "guide entry."
+        ),
+    },
+    {
         "id": "dvr_info",
         "label": "Auto-DVR / Replays",
         "type": "info",
@@ -360,7 +393,7 @@ def _touch_reload_token() -> None:
 
 class Plugin:
     name = "Sports Event Auto-Creator"
-    version = "1.2.0"
+    version = "1.3.0"
     description = (
         "Auto-creates event channels for sports (boxing, MotoGP, Tennis, ...) from "
         "EPG and stream-name searches, with per-sport jobs and a configurable schedule."
@@ -450,6 +483,18 @@ class Plugin:
             "button_variant": "outline",
             "button_color": "orange",
         },
+        {
+            "id": "adopt_group",
+            "label": "Adopt channels (job's group)",
+            "description": (
+                "Force-runs the ownership adoption heuristic against the job named in "
+                "'Job name for Run one job', even if its group already has ownership "
+                "tracked. Use when the automatic one-shot pass under-adopted a group."
+            ),
+            "button_label": "Adopt",
+            "button_variant": "outline",
+            "button_color": "grape",
+        },
     ]
 
     def __init__(self):
@@ -496,6 +541,9 @@ class Plugin:
             except Exception as e:
                 return {"status": "error", "message": f"Could not apply schedule: {e}"}
             return {"status": "ok", "message": f"Schedule applied: {desc}"}
+
+        if action == "adopt_group":
+            return self._adopt_group(settings, logger)
 
         if action in ("run_now", "dry_run", "run_single"):
             jobs, errors = runner.jobs_from_settings(settings)
@@ -705,6 +753,19 @@ class Plugin:
             if counts:
                 parts.append(f"Recording reconciliation: {', '.join(counts)}.")
 
+            channel_counts = []
+            for key, label in (("updated", "updated"), ("unowned_kept", "unowned kept"),
+                               ("number_conflicts", "number conflicts"),
+                               ("unnumbered", "unnumbered"), ("adopted", "adopted")):
+                total = 0
+                for job_stats in (last.get("jobs") or {}).values():
+                    if isinstance(job_stats, dict):
+                        total += job_stats.get(key, 0) or 0
+                if total:
+                    channel_counts.append(f"{total} {label}")
+            if channel_counts:
+                parts.append(f"Channel reconciliation: {', '.join(channel_counts)}.")
+
             success_at = last.get("last_success_at")
             if success_at:
                 parts.append(f"Last successful run: {success_at} "
@@ -767,4 +828,51 @@ class Plugin:
         if disabled:
             msg += f"; disabled: {', '.join(disabled)}"
         msg += f". Schedule: {tasks.describe_schedule(settings)}."
+
+        try:
+            number_warnings = runner.validate_job_number_ranges(jobs)
+        except Exception as e:
+            number_warnings = [f"Could not run numbering/purge pre-flight checks: {e}"]
+        if number_warnings:
+            msg += " WARNINGS — " + " | ".join(number_warnings)
         return {"status": "ok", "message": msg}
+
+    def _adopt_group(self, settings: dict, logger) -> dict:
+        job_name = (settings.get("job_filter") or "").strip()
+        if not job_name:
+            return {"status": "error",
+                    "message": "Set the 'Job name for Run one job' setting to the job "
+                               "whose group you want to force-adopt."}
+        jobs, errors = runner.jobs_from_settings(settings)
+        job = next((j for j in jobs if j.name.lower() == job_name.lower()), None)
+        if job is None:
+            return {"status": "error", "message": f"No valid job named '{job_name}' found."
+                                                  + (f" ({' | '.join(errors)})" if errors else "")}
+        try:
+            client = runner.OrmClient()
+            groups = client.get_channel_groups()
+            existing_group = next((g for g in groups if g["name"].lower() == job.group.lower()), None)
+            if existing_group is None:
+                return {"status": "error", "message": f"Group '{job.group}' does not exist yet."}
+            group_id = existing_group["id"]
+            all_channels = client.get_all_channels()
+            group_channels = [ch for ch in all_channels if ch.get("channel_group") == group_id]
+
+            all_streams = client.get_all_streams()
+            matched_ids = set()
+            for term in job.search:
+                for s in all_streams:
+                    if runner.engine.contains_normalized(term, s.get("name", "")):
+                        matched_ids.add(s["id"])
+
+            registry = runner.load_channel_registry(logger)
+            adopted, unowned = runner.run_adoption_pass(
+                registry, group_id, job.name, group_channels, matched_ids,
+                set(), logger, force=True)
+            runner.save_channel_registry(registry, logger)
+        except Exception as e:
+            logger.exception("adopt_group action failed")
+            return {"status": "error", "message": f"Adoption failed: {e}"}
+        return {"status": "ok",
+                "message": f"Adopted {adopted} channel(s) into job '{job.name}' "
+                           f"(group '{job.group}'); {unowned} left unowned."}

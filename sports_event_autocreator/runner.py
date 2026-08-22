@@ -55,6 +55,7 @@ JOB_DEFAULTS = {
     "search_descriptions": True,  # also match terms in EPG programme descriptions
     "group": "",                # target channel group name (required)
     "start_number": None,       # starting channel number
+    "end_number": None,         # ending channel number (0/None = unbounded/implied)
     "cleanup": False,           # delete channels matching excludes / too old
     "purge_unmatched": False,   # delete group channels not in current results
     "purge_group": False,       # delete ALL group channels before creating
@@ -80,6 +81,8 @@ JOB_DEFAULTS = {
     "record_duration_hours": 0,  # auto-DVR: length when the EPG has none (0 = global default)
     "record_shift_tolerance_hours": 3.0,  # auto-DVR: time-shift reconciliation window (0 = disable)
     "record_max_extension_hours": 2.0,    # auto-DVR: cap on extending a recording's end (0 = uncapped)
+    "update_in_place": False,   # Phase 1: reconcile an EPG time-shift into the existing channel
+    "channel_shift_tolerance_hours": 3.0,  # update_in_place: time-shift match tolerance
 }
 
 _LIST_KEYS = {"search", "exclude", "exclude_stream_prefixes", "pin_top", "epg_sources",
@@ -212,6 +215,11 @@ JOB_FIELD_SPECS = [
     ("unassigned",       "boolean", "Only unassigned streams",
      "Ignore streams already assigned to a channel."),
     ("start_number",     "number",  "Starting channel number (0 = none)", ""),
+    ("end_number",       "number",  "Ending channel number (0 = unbounded/implied)",
+     "Caps this job's own numbering range. 0 = unbounded UNLESS another enabled "
+     "job has a higher 'Starting channel number' — in that case this job's range "
+     "is implicitly capped just below that job's start (fixes a job silently "
+     "spilling into a neighboring job's numbers with zero config needed)."),
     ("preserve_below",   "number",  "Preserve channels numbered below (0 = off)",
      "With full purge: protect manually curated channels below this number."),
     ("preserve_above",   "number",  "Preserve channels numbered above (0 = off)",
@@ -269,6 +277,18 @@ JOB_FIELD_SPECS = [
      "many hours past the original end, so a bad EPG value can't schedule a "
      "runaway-length capture. 0 = uncapped (extend to whatever the EPG now "
      "says)."),
+    ("update_in_place",  "boolean", "Update matching channels in place (Phase 1 only)",
+     "OFF by default. When on, an EPG event that already has an owned channel "
+     "(exact identity, or a time-shift within the tolerance below) has its "
+     "streams/name/EPG link updated in place instead of being deleted and "
+     "recreated — the channel number never changes. Phase 2 (name-search) is "
+     "unaffected; always uses the existing delete/recreate behavior."),
+    ("channel_shift_tolerance_hours", "number",
+     "Update in place: time-shift tolerance (hours)",
+     "Only used when 'Update matching channels in place' is on. An EPG event "
+     "at a nearby but different time than an owned channel's last-known time "
+     "is treated as the same event (updated in place) as long as the shift is "
+     "within this many hours."),
 ]
 
 PURGE_MODE_OPTIONS = [
@@ -338,7 +358,7 @@ def job_ui_default(seeds: Dict[str, dict], name: str, key: str):
     val = _seed_value(seeds, name, key)
     if key in _LIST_KEYS:
         return "\n".join(val or [])
-    if key in ("start_number", "preserve_below", "preserve_above", "max_past_hours", "max_future_hours"):
+    if key in ("start_number", "end_number", "preserve_below", "preserve_above", "max_past_hours", "max_future_hours"):
         return val if val is not None else 0
     return val
 
@@ -389,13 +409,14 @@ def job_from_settings(settings: dict, name: str, seeds: Dict[str, dict],
             cfg["purge_unmatched"] = value == "purge_unmatched"
         elif ui_type == "lines":
             cfg[key] = _as_lines(value)
-        elif key in ("start_number", "preserve_below", "preserve_above", "max_past_hours", "max_future_hours"):
+        elif key in ("start_number", "end_number", "preserve_below", "preserve_above", "max_past_hours", "max_future_hours"):
             num = _as_number(value, 0)
             cfg[key] = num if num > 0 else None
         elif key == "record_duration_hours":
             num = _as_number(value, 0)
             cfg[key] = min(num, 12.0) if num > 0 else 0  # 0 = auto, clamp 12h
-        elif key in ("record_shift_tolerance_hours", "record_max_extension_hours"):
+        elif key in ("record_shift_tolerance_hours", "record_max_extension_hours",
+                    "channel_shift_tolerance_hours"):
             cfg[key] = max(_as_number(value, JOB_DEFAULTS[key]), 0.0)
         elif key == "days":
             cfg[key] = max(int(_as_number(value, JOB_DEFAULTS["days"])), 1)
@@ -474,7 +495,7 @@ def settings_updates_from_jobs(jobs: List[SimpleNamespace]) -> dict:
                                 else "none")
             elif ui_type == "lines":
                 updates[fid] = "\n".join(getattr(j, key))
-            elif key in ("start_number", "preserve_below", "preserve_above", "max_past_hours", "max_future_hours"):
+            elif key in ("start_number", "end_number", "preserve_below", "preserve_above", "max_past_hours", "max_future_hours"):
                 val = getattr(j, key)
                 updates[fid] = val if val is not None else 0
             else:
@@ -635,6 +656,48 @@ class OrmClient:
             ])
         return {"id": ch.id, "name": ch.name}
 
+    def get_used_channel_numbers(self) -> set:
+        """Instance-wide set of every channel number currently in use --
+        Channel.channel_number AND ChannelOverride.channel_number, mirroring
+        Dispatcharr's own build_reserved_set() (apps/channels/
+        compact_numbering.py), which reserves both for exactly this reason."""
+        from apps.channels.models import Channel, ChannelOverride
+        return load_channel_number_index(Channel, ChannelOverride)
+
+    def update_channel(self, channel_id: int, *, name: Optional[str] = None,
+                       stream_ids: Optional[List[int]] = None,
+                       tvg_id: Optional[str] = None,
+                       logo_url: Optional[str] = None) -> None:
+        """Update an existing channel's scalar fields and (optionally) its
+        stream set, atomically. ``channel_number`` is NEVER touched here --
+        update-in-place must never renumber a channel. ``stream_ids=None``
+        means "leave the stream set alone" (used when the recording guard
+        defers a stream-set swap but name/EPG can still be refreshed)."""
+        from django.db import transaction
+        from apps.channels.models import Channel, ChannelStream, Logo
+
+        with transaction.atomic():
+            updates = {}
+            if name is not None:
+                updates["name"] = name
+            if tvg_id is not None:
+                updates["tvg_id"] = tvg_id
+            if logo_url:
+                logo, _ = Logo.objects.get_or_create(
+                    url=logo_url, defaults={"name": name or "Unknown"})
+                updates["logo"] = logo
+            if updates:
+                Channel.objects.filter(id=channel_id).update(**updates)
+            if stream_ids is not None:
+                # Delete-then-recreate inside the SAME atomic block so the
+                # join table is never left half-swapped; nothing else can
+                # see the intermediate empty state.
+                ChannelStream.objects.filter(channel_id=channel_id).delete()
+                ChannelStream.objects.bulk_create([
+                    ChannelStream(channel_id=channel_id, stream_id=sid, order=i)
+                    for i, sid in enumerate(stream_ids)
+                ])
+
 
 # ---------------------------------------------------------------------------
 # EPG assignment for created channels
@@ -726,16 +789,47 @@ def cleanup_orphan_epg(logger) -> int:
     return count
 
 
+def _fetch_programmes_near(epg_data, sort_dt: datetime, tolerance_minutes: float) -> List[Dict]:
+    """Plain {"title", "start_time"} dicts (naive UTC) for the given
+    EPGData's ProgramData rows within tolerance_minutes of sort_dt -- feeds
+    engine.epg_link_is_trustworthy (Issue 4a)."""
+    from datetime import timezone as _tz
+    from apps.epg.models import ProgramData
+
+    lo = (sort_dt - timedelta(minutes=tolerance_minutes)).replace(tzinfo=_tz.utc)
+    hi = (sort_dt + timedelta(minutes=tolerance_minutes)).replace(tzinfo=_tz.utc)
+    out = []
+    for p in ProgramData.objects.filter(epg=epg_data, start_time__range=(lo, hi)).only(
+            "title", "start_time"):
+        start = p.start_time
+        if start is not None and start.tzinfo is not None:
+            start = start.astimezone(_tz.utc).replace(tzinfo=None)
+        out.append({"title": p.title or "", "start_time": start})
+    return out
+
+
 def assign_channel_epg(channel_id: int, display_name: str, source: str,
                        reason: str, sort_dt: Optional[datetime],
                        is_uncertain: bool, tvg_id: Optional[str],
                        epg_src_label: Optional[str],
-                       duration_hours: float) -> str:
+                       duration_hours: float,
+                       identity_title: Optional[str] = None,
+                       epg_link_tolerance_minutes: float = 90.0) -> str:
     """
-    Give a freshly created channel its EPG. Returns a short outcome string.
-    EPG-search hits link the real EPGData row; otherwise (name-search, or an
-    external feed not ingested in EPG Manager) a single event programme is
-    generated from the parsed title/time when the time is reliable.
+    Give a freshly created (or update-in-place-refreshed) channel its EPG.
+    Returns a short outcome string.
+
+    EPG-search hits (Phase 1) link the real EPGData row unconditionally --
+    the tvg_id came from the matched programme itself. Name-search hits
+    (Phase 2) with a harvested tvg_id now ALSO attempt a real-EPG link, but
+    only when corroborated (Issue 4a): the resolved EPGData must be an
+    active, non-plugin-synthetic source, AND have an actual programme within
+    tolerance of sort_dt whose title also matches -- either alone is not
+    enough (a provider's self-reported tvg_id on a name-search stream is
+    otherwise likely to be its generic 24/7 channel id, which would attach
+    an unrelated full-day guide purely because the times happen to align).
+    Uncorroborated Phase 2 hits, and everything else, fall through to the
+    generated single-event programme when the time is reliable.
     """
     title = display_name.split(" | ", 1)[-1].strip() or display_name
 
@@ -746,11 +840,328 @@ def assign_channel_epg(channel_id: int, display_name: str, source: str,
             src_name = getattr(epg_data.epg_source, "name", None) or "?"
             return f"linked to EPG source '{src_name}' (tvg_id '{tvg_id}')"
 
+    if source == "NAME" and tvg_id and sort_dt is not None and not is_uncertain:
+        epg_data = resolve_epg_data(tvg_id, None)
+        src_active = bool(epg_data is not None and getattr(epg_data.epg_source, "is_active", False))
+        src_synthetic = bool(epg_data is not None
+                            and getattr(epg_data.epg_source, "name", None) == PLUGIN_EPG_SOURCE_NAME)
+        if epg_data is not None and src_active and not src_synthetic:
+            programmes = _fetch_programmes_near(epg_data, sort_dt, epg_link_tolerance_minutes)
+            corrob_title = identity_title or title
+            trustworthy, corrob_reason = engine.epg_link_is_trustworthy(
+                programmes, corrob_title, sort_dt, epg_link_tolerance_minutes)
+            if trustworthy:
+                link_channel_epg(channel_id, epg_data)
+                src_name = getattr(epg_data.epg_source, "name", None) or "?"
+                return f"linked to EPG source '{src_name}' (tvg_id '{tvg_id}', corroborated)"
+            logging.getLogger("plugins.sports_event_autocreator").info(
+                f"[EPG-ASSIGN] Not linking real EPG for '{display_name}' "
+                f"(tvg_id '{tvg_id}'): {corrob_reason}")
+
     if sort_dt is not None and not is_uncertain:
         create_event_epg(channel_id, title, str(reason or ""), sort_dt, duration_hours)
         return f"event programme created ({duration_hours:g}h)"
 
     return "no reliable time — left to Dispatcharr's dummy EPG"
+
+
+# ---------------------------------------------------------------------------
+# Channel numbering (v1.3.0, Issue 1)
+#
+# Dispatcharr's own build_reserved_set() (apps/channels/compact_numbering.py)
+# reserves BOTH Channel.channel_number and ChannelOverride.channel_number
+# instance-wide -- load_channel_number_index mirrors that exactly.
+# ---------------------------------------------------------------------------
+
+def _channel_model():
+    """Seam for tests: monkeypatch to swap in a fake model."""
+    from apps.channels.models import Channel
+    return Channel
+
+
+def _channel_override_model():
+    """Seam for tests: monkeypatch to swap in a fake model."""
+    from apps.channels.models import ChannelOverride
+    return ChannelOverride
+
+
+def _channel_stream_model():
+    """Seam for tests: monkeypatch to swap in a fake model."""
+    from apps.channels.models import ChannelStream
+    return ChannelStream
+
+
+def load_channel_number_index(channel_model=None, channel_override_model=None) -> set:
+    """Instance-wide set of every channel number currently used by a real
+    Channel or a ChannelOverride, built once per task run and mutated in
+    place across jobs (see engine.NumberAllocator)."""
+    Channel = channel_model if channel_model is not None else _channel_model()
+    ChannelOverride = (channel_override_model if channel_override_model is not None
+                      else _channel_override_model())
+    used = set()
+    for n in Channel.objects.exclude(channel_number__isnull=True).values_list(
+            "channel_number", flat=True):
+        if n is not None:
+            used.add(float(n))
+    for n in ChannelOverride.objects.filter(channel_number__isnull=False).values_list(
+            "channel_number", flat=True):
+        if n is not None:
+            used.add(float(n))
+    return used
+
+
+def compute_job_number_spans(jobs) -> Dict[str, Tuple[float, Optional[float]]]:
+    """job_name -> (lo, hi_or_None) for every job in ``jobs`` that has a
+    start_number set. ``hi`` is the job's own end_number when set (>0), else
+    implied as (next-higher OTHER job's start_number - 1), or unbounded
+    (None) when this job has the highest start_number among them. Callers
+    are expected to pass only the jobs whose spans should count (typically
+    the enabled ones).
+
+    Two (or more) jobs tied on the same start_number (with none of them
+    setting end_number) would otherwise ALL come out unbounded -- none is
+    "higher" than another, so none bounds another, and their mutually
+    unbounded spans are exactly what can hang NumberAllocator.next_free().
+    That's a config error (see validate_job_number_ranges, which warns about
+    it), but the allocator's ``blocked_ranges`` must still never leave two
+    jobs mutually unbounded, so ties are broken deterministically by job
+    name: within a tied group, every job except the alphabetically-last one
+    is treated as a single-slot span (bounded at its own start_number),
+    exactly as if the next tied name's start_number were "the next higher
+    start_number". Only the alphabetically-last job in the tied group keeps
+    looking at genuinely higher (distinct) start_numbers for its bound.
+    """
+    numbered = [j for j in jobs if j.start_number is not None]
+    spans: Dict[str, Tuple[float, Optional[float]]] = {}
+    for j in numbered:
+        lo = j.start_number
+        if j.end_number:
+            hi = j.end_number
+        else:
+            higher = [j2.start_number for j2 in numbered
+                     if j2.name != j.name and j2.start_number > lo]
+            tied_names = sorted(j2.name for j2 in numbered
+                                if j2.start_number == lo)
+            if len(tied_names) > 1 and j.name != tied_names[-1]:
+                # Not the last name in the tied group -- bound to a single
+                # slot so it never comes out mutually unbounded with a peer.
+                hi = lo
+            else:
+                hi = (min(higher) - 1) if higher else None
+        spans[j.name] = (lo, hi)
+    return spans
+
+
+def validate_job_number_ranges(jobs) -> List[str]:
+    """Pre-flight WARNINGS (never hard errors) about numbering/purge config,
+    using only the ENABLED jobs among ``jobs`` (a disabled job neither
+    consumes nor implies a range): overlapping explicit ranges, two or more
+    enabled jobs sharing the same start_number, a narrow (<20 slots) implied
+    range, two enabled jobs sharing one channel group, and purge_group with
+    no preserve fence at all."""
+    warnings: List[str] = []
+    enabled = [j for j in jobs if j.enabled]
+    spans = compute_job_number_spans(enabled)
+
+    explicit = [(j.name, j.start_number, j.end_number) for j in enabled
+                if j.start_number is not None and j.end_number]
+    for i in range(len(explicit)):
+        for k in range(i + 1, len(explicit)):
+            n1, lo1, hi1 = explicit[i]
+            n2, lo2, hi2 = explicit[k]
+            if lo1 <= hi2 and lo2 <= hi1:
+                warnings.append(
+                    f"Jobs '{n1}' ({lo1:g}-{hi1:g}) and '{n2}' ({lo2:g}-{hi2:g}) have "
+                    f"overlapping explicit channel-number ranges.")
+
+    by_start: Dict[float, List[str]] = defaultdict(list)
+    for j in enabled:
+        if j.start_number is not None:
+            by_start[j.start_number].append(j.name)
+    for start, names in by_start.items():
+        if len(names) > 1:
+            quoted = ", ".join("'%s'" % n for n in sorted(names))
+            warnings.append(
+                f"Jobs {quoted} all share the same start number ({start:g}) -- "
+                f"their numbering ranges are ambiguous; give each job its own "
+                f"start_number.")
+
+    for j in enabled:
+        if j.start_number is None or j.end_number:
+            continue
+        lo, hi = spans.get(j.name, (j.start_number, None))
+        if hi is not None and (hi - lo) < 20:
+            neighbor = next((j2.name for j2 in enabled
+                             if j2.start_number == hi + 1 and j2.name != j.name), "?")
+            warnings.append(
+                f"Job '{j.name}' has an implied numbering range of only "
+                f"{hi - lo + 1:g} slot(s) ({lo:g}-{hi:g}) before job '{neighbor}' "
+                f"starts at {hi + 1:g}.")
+
+    by_group: Dict[str, List[str]] = defaultdict(list)
+    for j in enabled:
+        by_group[(j.group or "").strip().lower()].append(j.name)
+    for group, names in by_group.items():
+        if group and len(names) > 1:
+            warnings.append(f"Jobs share the same channel group '{group}': {', '.join(names)}.")
+
+    for j in enabled:
+        if j.purge_group and j.preserve_below is None and j.preserve_above is None:
+            warnings.append(
+                f"Job '{j.name}' has 'Full purge' with neither 'Preserve below' "
+                f"nor 'Preserve above' set — every channel in its group is at risk.")
+
+    return warnings
+
+
+# ---------------------------------------------------------------------------
+# Channel ownership (v1.3.0, Issue 2)
+#
+# Ownership must be plugin-side: Dispatcharr's Channel model has no
+# custom_properties/JSON field to tag it on. channel_registry.json lives in
+# plugin_state_dir() (survives a plugin re-import) and follows the exact
+# atomic-write conventions as auto_dvr_state.json.
+# ---------------------------------------------------------------------------
+
+_REGISTRY_MAX_ENTRIES = 20000
+
+
+def _channel_registry_file_path() -> str:
+    return os.path.join(plugin_state_dir(), "channel_registry.json")
+
+
+def load_channel_registry(logger=None) -> Dict:
+    path = _channel_registry_file_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("channels"), dict):
+            data.setdefault("version", 1)
+            return data
+    except Exception:
+        pass
+    return {"version": 1, "channels": {}}
+
+
+def save_channel_registry(registry: Dict, logger) -> None:
+    path = _channel_registry_file_path()
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(registry, f)
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o666)
+        except OSError:
+            pass
+    except Exception as e:
+        logger.warning(f"[OWNERSHIP] Could not persist channel registry: {e}")
+
+
+def prune_channel_registry(registry: Dict, existing_channel_ids: set, logger) -> int:
+    """Drop entries for channel ids that no longer exist, then hard-cap at
+    _REGISTRY_MAX_ENTRIES (keep the most-recently-seen). Returns the number
+    of entries kept."""
+    channels = registry.get("channels", {})
+    kept = {cid: entry for cid, entry in channels.items()
+           if _safe_int(cid) in existing_channel_ids}
+    if len(kept) > _REGISTRY_MAX_ENTRIES:
+        ranked = sorted(kept.items(),
+                        key=lambda kv: kv[1].get("last_seen_at") or "", reverse=True)
+        kept = dict(ranked[:_REGISTRY_MAX_ENTRIES])
+    registry["channels"] = kept
+    return len(kept)
+
+
+def _safe_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+# tvg_id assigned to the synthetic EPGData row create_event_epg() makes for
+# a generated event programme -- see that function. Matching this exactly
+# (not re-deriving the format) is what lets the adoption heuristic recognize
+# a plugin-generated channel by its EPG-assigned tvg_id.
+_SYNTHETIC_TVG_ID_RE = re.compile(r'^sea-ch-(\d+)$')
+
+
+def _looks_plugin_generated(ch: Dict) -> bool:
+    """True if a channel's EPG-assigned tvg_id or its own tvg_id matches this
+    plugin's synthetic 'sea-ch-<its own id>' pattern, OR its name matches the
+    generated date-prefixed name pattern (reuses engine.GENERATED_NAME_DATE_RE,
+    the same regex is_channel_too_old already parses this format with)."""
+    for tvg in (ch.get("epg_tvg_id") or "", ch.get("tvg_id") or ""):
+        m = _SYNTHETIC_TVG_ID_RE.match(tvg)
+        if m and _safe_int(m.group(1)) == ch.get("id"):
+            return True
+    if engine.GENERATED_NAME_DATE_RE.search(ch.get("name") or ""):
+        return True
+    return False
+
+
+def run_adoption_pass(registry: Dict, group_id: int, job_name: str,
+                      group_channels: List[Dict], matched_stream_ids: set,
+                      adopted_groups_seen: set, logger,
+                      force: bool = False) -> Tuple[int, int]:
+    """One-shot per-group adoption heuristic. No-ops (returns (0, 0)) if this
+    group already has a registry entry and ``force`` is False, or if this
+    group was already processed earlier in the SAME run (coordinated via
+    ``adopted_groups_seen``, a plain set the caller shares across jobs one
+    run — never persisted). ``force=True`` (the manual 'adopt_group' action)
+    skips both of those gates but still never re-adopts a channel that
+    already has a registry entry.
+
+    A channel is adopted when it matches the plugin's own EPG fingerprint
+    (tvg_id 'sea-ch-<id>'), the plugin's generated-name pattern, or shares a
+    stream id with something this run's job prepared. Anything else is left
+    unowned (protects real manual channels). Returns (adopted, unowned_kept).
+
+    A group is recorded as scanned (persisted, in ``registry["scanned_groups"]``)
+    once this pass has actually run for it, even when zero channels were
+    adopted (all left unowned) -- otherwise a group with nothing adoptable
+    never gains a registry entry and this (harmless but wasteful) pass would
+    re-attempt it on every single future run instead of once.
+    """
+    channels = registry.setdefault("channels", {})
+    scanned_groups = registry.setdefault("scanned_groups", [])
+
+    if not force:
+        if group_id in adopted_groups_seen:
+            return 0, 0
+        if (group_id in scanned_groups
+                or any(entry.get("group_id") == group_id for entry in channels.values())):
+            adopted_groups_seen.add(group_id)
+            return 0, 0
+    adopted_groups_seen.add(group_id)
+
+    adopted = 0
+    unowned = 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for ch in group_channels:
+        cid = ch.get("id")
+        if str(cid) in channels:
+            continue
+        shares_stream = any(sid in matched_stream_ids for sid in ch.get("streams", []))
+        if _looks_plugin_generated(ch) or shares_stream:
+            channels[str(cid)] = {
+                "job": job_name, "group_id": group_id,
+                "number": ch.get("channel_number"), "name": ch.get("name", ""),
+                "identity": "", "title_norm": "", "event_iso": "",
+                "stream_ids": list(ch.get("streams", [])), "slot": None,
+                "source": "adopted", "adopted": True,
+                "created_at": now_iso, "last_seen_at": now_iso,
+            }
+            adopted += 1
+        else:
+            unowned += 1
+    if adopted or unowned:
+        logger.info(f"[OWNERSHIP] Adopted {adopted} channel(s) into job '{job_name}' "
+                    f"(group {group_id}); {unowned} left unowned")
+    if group_id not in scanned_groups:
+        scanned_groups.append(group_id)
+    return adopted, unowned
 
 
 # ---------------------------------------------------------------------------
@@ -1839,7 +2250,7 @@ def probe_stream_black(url: str, user_agent: str, sample_seconds: float,
 
 def _select_unblack_streams(streams: List[Dict], needed: Optional[int],
                             probe_state: Dict, job_name: str, title: str,
-                            logger) -> List[Dict]:
+                            logger, stats: Optional[Dict] = None) -> List[Dict]:
     """
     Probe candidate streams (in their existing priority order) and return only
     the confirmed-good ones: black screens AND failed probes (timeout, HTTP
@@ -1849,18 +2260,47 @@ def _select_unblack_streams(streams: List[Dict], needed: Optional[int],
     limitation, not evidence against the stream.
 
     Results are cached in probe_state["cache"] (shared across events and jobs
-    in one run) and constrained by probe_state["budget"]. When `needed` is not
-    None (split mode with max_split>0), probing stops early once that many good
-    streams are found. An empty return means every candidate failed the check.
+    in one run). Spending is per-job: probe_state["plan"][job_name] holds this
+    job's guaranteed "reserve" (see engine.probe_budget_plan) and its own
+    "used" counter; once the reserve is exhausted, the run's shared
+    probe_state["surplus"]["remaining"] pool is spent (first-come across
+    jobs). Exhaustion is logged once PER JOB (via plan["warned"]), not once
+    per run and not once per candidate. `stats` (this job's stats dict), when
+    given, is incremented: "probes" for every probe actually spent, and
+    "probe_capped" for every candidate left unprobed specifically because the
+    budget ran out (as opposed to ffmpeg being unavailable).
+
+    When `needed` is not None (split mode with max_split>0), probing stops
+    early once that many good streams are found. An empty return means every
+    candidate failed the check.
     """
     cache = probe_state["cache"]
     sample_seconds = probe_state["sample_seconds"]
+    plan = (probe_state.get("plan") or {}).get(job_name)
+    surplus = probe_state.get("surplus")
 
     ffmpeg_ok = shutil.which("ffmpeg") is not None
     if not ffmpeg_ok and not probe_state.get("ffmpeg_missing_logged"):
         logger.warning(f"[{job_name}] [BLACK-CHECK] ffmpeg not found — cannot probe "
                        f"streams; keeping all candidates this run")
         probe_state["ffmpeg_missing_logged"] = True
+
+    def _budget_available() -> bool:
+        if plan is None:
+            return True  # no plan configured (e.g. legacy/test caller): unlimited
+        if plan["reserve"] - plan["used"] > 0:
+            return True
+        return bool(surplus and surplus.get("remaining", 0) > 0)
+
+    def _spend_budget() -> None:
+        if plan is not None:
+            if plan["reserve"] - plan["used"] > 0:
+                plan["used"] += 1
+            elif surplus is not None and surplus.get("remaining", 0) > 0:
+                surplus["remaining"] -= 1
+                plan["used"] += 1
+        if stats is not None:
+            stats["probes"] = stats.get("probes", 0) + 1
 
     good: List[Dict] = []
     kept_unprobed: List[Dict] = []
@@ -1870,19 +2310,26 @@ def _select_unblack_streams(streams: List[Dict], needed: Optional[int],
 
         if sid in cache:
             verdict, mean, reason = cache[sid]
-        elif not ffmpeg_ok or probe_state["budget"] <= 0:
+        elif not ffmpeg_ok or not _budget_available():
             # Couldn't probe (system-level): keep, but never ahead of a
             # confirmed-good stream.
-            if ffmpeg_ok and not probe_state.get("budget_exhausted_logged"):
-                logger.warning(f"[{job_name}] [BLACK-CHECK] Probe budget exhausted for "
-                               f"this run — remaining streams kept unprobed")
-                probe_state["budget_exhausted_logged"] = True
+            if ffmpeg_ok:
+                if plan is not None and not plan.get("warned"):
+                    logger.warning(f"[{job_name}] [BLACK-CHECK] Probe budget exhausted for "
+                                   f"this job — remaining candidates kept unprobed")
+                    plan["warned"] = True
+                elif plan is None and not probe_state.get("budget_exhausted_logged"):
+                    logger.warning(f"[{job_name}] [BLACK-CHECK] Probe budget exhausted for "
+                                   f"this run — remaining streams kept unprobed")
+                    probe_state["budget_exhausted_logged"] = True
+                if stats is not None:
+                    stats["probe_capped"] = stats.get("probe_capped", 0) + 1
             kept_unprobed.append(s)
             continue
         else:
             verdict, mean, reason = probe_stream_black(
                 s.get("url", ""), s.get("user_agent", ""), sample_seconds, logger)
-            probe_state["budget"] -= 1
+            _spend_budget()
             cache[sid] = (verdict, mean, reason)
             if verdict == engine.PROBE_GOOD:
                 logger.info(f"[{job_name}] [BLACK-CHECK] '{title}': stream '{name}' "
@@ -1914,11 +2361,20 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
             record_pre_pad_min: float = 5.0,
             record_post_pad_min: float = 30.0,
             max_simultaneous_recordings: int = 0,
-            dvr_index: Optional[List[Dict]] = None) -> Dict:
+            dvr_index: Optional[List[Dict]] = None,
+            number_index: Optional[set] = None,
+            blocked_ranges: Optional[List[Tuple[str, float, Optional[float]]]] = None,
+            job_number_end: Optional[float] = None,
+            channel_registry: Optional[Dict] = None,
+            known_job_names: Optional[set] = None,
+            adoption_state: Optional[set] = None,
+            epg_link_tolerance_minutes: float = 90.0) -> Dict:
     """
     Execute one job. Returns a stats dict:
     {prepared, created, deleted, skipped, preserved, errors, recorded,
-     capped, extended, rescheduled, epg_scanned, epg_matched}.
+     capped, extended, rescheduled, epg_scanned, epg_matched, probes,
+     probe_capped, unnumbered, number_conflicts, unowned_kept, adopted,
+     updated, update_deferred}.
 
     xmltv_cache lets multiple jobs sharing one XMLTV URL/EPG source fetch it
     only once per run. With assign_epg, created channels are linked to real
@@ -1929,12 +2385,33 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
     ensure_recording), built once per task run (not once per job) and passed
     down here so recordings across jobs in the same run still dedup against
     each other correctly.
+
+    ``number_index``: the run's shared load_channel_number_index() set (see
+    engine.NumberAllocator), mutated in place across jobs so job B sees job
+    A's freshly created numbers within the same run.
+
+    ``blocked_ranges``: (job_name, lo, hi_or_None) for every enabled job's
+    numbering span this run (see runner.compute_job_number_spans), fed into
+    this job's NumberAllocator so it never spills into a sibling job's range.
+    ``job_number_end``: this job's OWN upper bound (its span's `hi`), if any.
+
+    ``channel_registry``: the run's shared channel_registry.json dict (see
+    load_channel_registry), mutated in place and saved by the caller after
+    each job. ``known_job_names``: every currently-configured job name
+    (enabled or not) -- a channel owned by a disabled-but-still-configured
+    job is never treated as orphaned. ``adoption_state``: a plain set shared
+    across jobs in this run coordinating the one-shot-per-group adoption
+    pass (never persisted).
     """
     client = OrmClient()
     stats = {"prepared": 0, "created": 0, "deleted": 0,
              "skipped": 0, "preserved": 0, "errors": 0, "recorded": 0,
              "capped": 0, "extended": 0, "rescheduled": 0,
-             "epg_scanned": 0, "epg_matched": 0}
+             "epg_scanned": 0, "epg_matched": 0,
+             "probes": 0, "probe_capped": 0,
+             "unnumbered": 0, "number_conflicts": 0,
+             "unowned_kept": 0, "adopted": 0,
+             "updated": 0, "update_deferred": 0}
 
     channels_to_create: List[Tuple] = []
     all_matched_stream_ids: set = set()
@@ -2150,7 +2627,7 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                 needed = ((job.max_split if job.max_split > 0 else None)
                           if job.split_streams else None)
                 selected = _select_unblack_streams(
-                    streams, needed, probe_state, job.name, title, logger)
+                    streams, needed, probe_state, job.name, title, logger, stats=stats)
                 if not selected:
                     logger.info(f"[{job.name}] [EPG] Skipped '{title}': all "
                                 f"{len(streams)} candidate streams are black "
@@ -2184,17 +2661,17 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
 
             if job.split_streams:
                 streams_to_use = streams[:job.max_split] if job.max_split > 0 else streams
-                for s in streams_to_use:
+                for slot, s in enumerate(streams_to_use):
                     all_matched_stream_ids.add(s["id"])
                     channels_to_create.append(
                         (base_display_name, [s["id"]], "EPG", title, start_utc, False,
-                         ref_eid, ref_src, title))
+                         ref_eid, ref_src, title, slot))
             else:
                 ids = [s["id"] for s in streams]
                 all_matched_stream_ids.update(ids)
                 channels_to_create.append(
                     (base_display_name, ids, "EPG", title, start_utc, False,
-                     ref_eid, ref_src, title))
+                     ref_eid, ref_src, title, None))
 
         logger.info(f"[{job.name}] [EPG] Prepared {sum(1 for c in channels_to_create if c[2] == 'EPG')} channels")
 
@@ -2266,7 +2743,7 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
         for _, streams_list in by_event_name.items():
             if job.split_streams:
                 streams_to_use = streams_list[:job.max_split] if job.max_split > 0 else streams_list
-                for s in streams_to_use:
+                for slot, s in enumerate(streams_to_use):
                     raw_name = s.get("name", "")
                     if job.require_time and not _has_reliable_date(raw_name):
                         name_filtered_count += 1
@@ -2292,7 +2769,7 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                     identity_title = engine.clean_stream_name(raw_name)
                     channels_to_create.append(
                         (display_name, [s["id"]], "NAME", raw_name, sort_dt, is_uncertain,
-                         tvg_id_for_channel, None, identity_title))
+                         tvg_id_for_channel, None, identity_title, slot))
             else:
                 all_ids = [s["id"] for s in streams_list]
                 representative = streams_list[0]
@@ -2317,7 +2794,7 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                 identity_title = engine.clean_stream_name(raw_name)
                 channels_to_create.append(
                     (display_name, all_ids, "NAME", raw_name, sort_dt, is_uncertain,
-                     tvg_id_for_channel, None, identity_title))
+                     tvg_id_for_channel, None, identity_title, None))
 
         if name_filtered_count > 0:
             logger.info(f"[{job.name}] [NAME] Filtered out {name_filtered_count} streams by date/time flags")
@@ -2354,16 +2831,220 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
         target_group_id = new_group["id"]
         logger.info(f"[{job.name}] Created group: '{job.group}' ({target_group_id})")
 
+    channel_number_by_id: Dict[int, Optional[float]] = {
+        ch.get("id"): ch.get("channel_number") for ch in all_existing_channels}
+    _known_job_names = known_job_names if known_job_names is not None else {job.name}
+    registry_channels = (channel_registry.setdefault("channels", {})
+                        if channel_registry is not None else {})
+
+    # Channel-number allocator (Issue 1): instance-wide `used` set (mutated in
+    # place by this and every other job this run), and every OTHER enabled
+    # job's blocked span (this job's own span never blocks itself).
+    allocator = engine.NumberAllocator(
+        used=number_index if number_index is not None else set(),
+        # run_job's own `blocked_ranges` param is (job_name, lo, hi); engine.
+        # NumberAllocator's constructor expects (lo, hi, owner_job_name).
+        blocked_ranges=[(lo, hi, name) for name, lo, hi in (blocked_ranges or [])])
+
+    def _maybe_record(chan_id, display_name, reason, sort_dt, is_uncertain, identity_title):
+        """Auto-DVR: create a Recording for this event channel if the job's
+        record filter matches its title. Opt-in (no patterns → nothing), and
+        skipped for dry runs, unknown channel ids, and uncertain-time streams
+        (a guessed time would schedule the recording wrong)."""
+        if dry_run or chan_id is None or sort_dt is None or is_uncertain:
+            return
+        if not job.record_patterns:
+            return
+        if not engine.record_matches(job.record_patterns, job.record_exclude,
+                                     display_name, reason):
+            return
+        try:
+            # Priority: real EPG span > per-job override > global default.
+            dur_hours = (record_duration_by_name.get((identity_title, sort_dt))
+                         or job.record_duration_hours
+                         or event_duration_hours)
+            result = ensure_recording(
+                chan_id, sort_dt, dur_hours,
+                record_pre_pad_min, record_post_pad_min,
+                {"source": "sports-plugin", "job": job.name,
+                 "program": {"title": display_name}}, logger,
+                max_simultaneous=max_simultaneous_recordings,
+                identity_title=identity_title, index=dvr_index,
+                shift_tolerance_hours=job.record_shift_tolerance_hours,
+                max_extension_hours=job.record_max_extension_hours)
+            if result == "created":
+                logger.info(f"[{job.name}] [DVR] Scheduled recording for '{display_name}'")
+                stats["recorded"] += 1
+            elif result in ("extended", "rescheduled", "capped"):
+                stats[result] += 1
+            if getattr(result, "also_extended", False):
+                stats["extended"] += 1
+        except Exception as e:
+            logger.error(f"[{job.name}] [DVR] Failed to schedule recording for "
+                         f"'{display_name}': {e}")
+            stats["errors"] += 1
+
+    # ------------------------ UPDATE-IN-PLACE (Issue 4b) ----------------------
+    # Phase 1 only, per-job opt-in, default off. Runs between sort/pin-top and
+    # cleanup: matched entries are pulled OUT of channels_to_create (they are
+    # reconciled here, not created/skipped below) and their channel ids are
+    # added to claimed_ids so the purge pass below never deletes them.
+    claimed_ids: set = set()
+    if (job.update_in_place and channel_registry is not None
+            and target_group_id is not None):
+        owned_candidates = []
+        for cid_str, entry in registry_channels.items():
+            if entry.get("job") != job.name or entry.get("group_id") != target_group_id:
+                continue
+            cid = _safe_int(cid_str)
+            if cid is None:
+                continue
+            try:
+                event_dt = datetime.fromisoformat(entry.get("event_iso") or "")
+            except ValueError:
+                event_dt = None
+            owned_candidates.append({
+                "channel_id": cid, "title_norm": entry.get("title_norm") or "",
+                "event_iso": entry.get("event_iso") or "", "event_dt": event_dt,
+                "stream_ids": entry.get("stream_ids") or [], "slot": entry.get("slot"),
+            })
+
+        remaining = list(owned_candidates)
+        kept_for_create: List[Tuple] = []
+        for entry in channels_to_create:
+            (display_name, ids, source, reason, sort_dt, is_uncertain,
+             tvg_id, epg_src_label, identity_title, slot) = entry
+            if source != "EPG" or sort_dt is None:
+                kept_for_create.append(entry)
+                continue
+
+            desired = {
+                "title_norm": engine.normalize_event_title(identity_title),
+                "event_iso": sort_dt.isoformat(), "event_dt": sort_dt,
+                "stream_ids": ids, "slot": slot,
+            }
+            action, target_cid, act_reason = engine.decide_channel_action(
+                desired, remaining, job.channel_shift_tolerance_hours)
+            if action != "update" or target_cid is None:
+                kept_for_create.append(entry)
+                continue
+
+            remaining = [c for c in remaining if c["channel_id"] != target_cid]
+            claimed_ids.add(target_cid)
+
+            if dry_run:
+                logger.info(f"[{job.name}] [DRY RUN] [UPDATE-IN-PLACE] Would update "
+                            f"channel {target_cid}: '{display_name}' ({act_reason})")
+                stats["updated"] += 1
+                continue
+
+            try:
+                try:
+                    recording_blocked = _has_active_or_future_recording(target_cid)
+                except Exception:
+                    logger.exception(f"[{job.name}] [UPDATE-IN-PLACE] Recording check "
+                                     f"failed for channel {target_cid}; deferring stream swap")
+                    recording_blocked = True
+
+                logo_url = None
+                if use_stream_logo:
+                    logo_url = next(
+                        (lu for sid in ids
+                         if (lu := (streams_by_id.get(sid) or {}).get("logo_url"))), None)
+
+                prior_entry = registry_channels.get(str(target_cid), {})
+                if recording_blocked:
+                    client.update_channel(target_cid, name=display_name,
+                                          stream_ids=None, tvg_id=tvg_id, logo_url=logo_url)
+                    stats["update_deferred"] += 1
+                    logger.info(f"[{job.name}] [UPDATE-IN-PLACE] Deferred stream-set "
+                                f"change for channel {target_cid} (active/future "
+                                f"recording); name/EPG updated")
+                    kept_stream_ids = prior_entry.get("stream_ids") or ids
+                else:
+                    client.update_channel(target_cid, name=display_name,
+                                          stream_ids=ids, tvg_id=tvg_id, logo_url=logo_url)
+                    kept_stream_ids = ids
+
+                if assign_epg:
+                    try:
+                        outcome = assign_channel_epg(
+                            target_cid, display_name, source, reason, sort_dt,
+                            is_uncertain, tvg_id, epg_src_label, event_duration_hours,
+                            identity_title=identity_title,
+                            epg_link_tolerance_minutes=epg_link_tolerance_minutes)
+                        logger.info(f"[{job.name}] [EPG-ASSIGN] {outcome}: '{display_name}'")
+                    except Exception as e:
+                        logger.error(f"[{job.name}] [EPG-ASSIGN] Failed for '{display_name}': {e}")
+
+                now_iso = datetime.now(timezone.utc).isoformat()
+                registry_channels[str(target_cid)] = {
+                    "job": job.name, "group_id": target_group_id,
+                    "number": prior_entry.get("number"), "name": display_name,
+                    "identity": engine.event_identity(identity_title, sort_dt.isoformat()),
+                    "title_norm": desired["title_norm"], "event_iso": desired["event_iso"],
+                    "stream_ids": kept_stream_ids, "slot": slot, "source": source,
+                    "adopted": prior_entry.get("adopted", False),
+                    "created_at": prior_entry.get("created_at") or now_iso,
+                    "last_seen_at": now_iso,
+                }
+                logger.info(f"[{job.name}] [UPDATE-IN-PLACE] Updated channel "
+                           f"{target_cid}: '{display_name}' ({act_reason})")
+                stats["updated"] += 1
+                _maybe_record(target_cid, display_name, reason, sort_dt, is_uncertain, identity_title)
+            except Exception as e:
+                logger.error(f"[{job.name}] [UPDATE-IN-PLACE] Failed to update channel "
+                             f"{target_cid}: {e}")
+                stats["errors"] += 1
+
+        channels_to_create = kept_for_create
+
     # ------------------------------ CLEANUP ----------------------------------
     if target_group_id:
         group_channels = [ch for ch in all_existing_channels
                           if ch.get("channel_group") == target_group_id]
         prepared_names = {c[0] for c in channels_to_create}
 
+        if channel_registry is not None:
+            pass_adopted, _pass_unowned = run_adoption_pass(
+                channel_registry, target_group_id, job.name, group_channels,
+                all_matched_stream_ids,
+                adoption_state if adoption_state is not None else set(), logger)
+            stats["adopted"] += pass_adopted
+            # NOT adding _pass_unowned here: every channel the adoption pass
+            # leaves unowned still has no registry entry afterwards, so the
+            # per-channel loop below counts it again via its own
+            # "owner is None" branch. Counting both would double-count the
+            # same unowned channels on the one run where the adoption pass
+            # actually does something (a group's first/adoption run) --
+            # the per-channel loop is the single source of truth for
+            # unowned_kept, on every run, adoption or not.
+
         for ch in group_channels:
             ch_name = ch.get("name", "")
+            cid = ch.get("id")
             should_delete = False
             reason = ""
+
+            if cid in claimed_ids:
+                continue  # reconciled by update-in-place above; never delete
+
+            if channel_registry is not None:
+                owner = registry_channels.get(str(cid), {}).get("job")
+                is_preserved_flag = _is_preserved_number(ch.get("channel_number"), job)
+                delete_eligible, purge_reason = engine.decide_channel_purge(
+                    ch, owner, job.name, _known_job_names, is_preserved_flag)
+                if not delete_eligible:
+                    if owner is None:
+                        stats["unowned_kept"] += 1
+                    continue
+                if purge_reason.startswith("adopting from removed job"):
+                    entry = dict(registry_channels.get(str(cid)) or {})
+                    entry["job"] = job.name
+                    entry["last_seen_at"] = datetime.now(timezone.utc).isoformat()
+                    registry_channels[str(cid)] = entry
+                    stats["adopted"] += 1
+                    logger.info(f"[{job.name}] [OWNERSHIP] {purge_reason}: '{ch_name}'")
 
             # 0. Purge entire group — takes precedence over all other rules
             if job.purge_group:
@@ -2398,11 +3079,16 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                         reason = "outdated event (streams reused by a newer event)"
 
             if should_delete:
+                ch_num = ch.get("channel_number")
                 if dry_run:
                     logger.info(f"[{job.name}] [DRY RUN] Would delete ({reason}): '{ch_name}'")
                     actually_deleted_stream_ids.update(ch.get("streams", []))
                     actually_deleted_names.add(ch_name)
                     stats["deleted"] += 1
+                    allocator.release(ch_num)
+                    if number_index is not None and ch_num is not None:
+                        number_index.discard(float(ch_num))
+                    registry_channels.pop(str(cid), None)
                 else:
                     # Purge guard: never delete a channel mid-recording or with
                     # a pending/future recording — that would kill the ffmpeg
@@ -2427,6 +3113,10 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                         actually_deleted_stream_ids.update(ch.get("streams", []))
                         actually_deleted_names.add(ch_name)
                         stats["deleted"] += 1
+                        allocator.release(ch_num)
+                        if number_index is not None and ch_num is not None:
+                            number_index.discard(float(ch_num))
+                        registry_channels.pop(str(cid), None)
                     except Exception as e:
                         logger.error(f"[{job.name}] Failed to delete '{ch_name}': {e}")
                         stats["errors"] += 1
@@ -2481,67 +3171,44 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                 return group_channel_id_by_stream[sid]
         return None
 
-    def _maybe_record(chan_id, display_name, reason, sort_dt, is_uncertain, identity_title):
-        """Auto-DVR: create a Recording for this event channel if the job's
-        record filter matches its title. Opt-in (no patterns → nothing), and
-        skipped for dry runs, unknown channel ids, and uncertain-time streams
-        (a guessed time would schedule the recording wrong)."""
-        if dry_run or chan_id is None or sort_dt is None or is_uncertain:
-            return
-        if not job.record_patterns:
-            return
-        if not engine.record_matches(job.record_patterns, job.record_exclude,
-                                     display_name, reason):
-            return
-        try:
-            # Priority: real EPG span > per-job override > global default.
-            dur_hours = (record_duration_by_name.get((identity_title, sort_dt))
-                         or job.record_duration_hours
-                         or event_duration_hours)
-            result = ensure_recording(
-                chan_id, sort_dt, dur_hours,
-                record_pre_pad_min, record_post_pad_min,
-                {"source": "sports-plugin", "job": job.name,
-                 "program": {"title": display_name}}, logger,
-                max_simultaneous=max_simultaneous_recordings,
-                identity_title=identity_title, index=dvr_index,
-                shift_tolerance_hours=job.record_shift_tolerance_hours,
-                max_extension_hours=job.record_max_extension_hours)
-            if result == "created":
-                logger.info(f"[{job.name}] [DVR] Scheduled recording for '{display_name}'")
-                stats["recorded"] += 1
-            elif result in ("extended", "rescheduled", "capped"):
-                stats[result] += 1
-            if getattr(result, "also_extended", False):
-                stats["extended"] += 1
-        except Exception as e:
-            logger.error(f"[{job.name}] [DVR] Failed to schedule recording for "
-                         f"'{display_name}': {e}")
-            stats["errors"] += 1
-
     logger.info(f"[{job.name}] Creating/updating {len(channels_to_create)} channels...")
     current_chan_num = job.start_number
-    for display_name, ids, source, reason, sort_dt, is_uncertain, tvg_id, epg_src_label, identity_title in channels_to_create:
+    for display_name, ids, source, reason, sort_dt, is_uncertain, tvg_id, epg_src_label, identity_title, slot in channels_to_create:
         if display_name in existing_names or any(sid in streams_in_group for sid in ids):
             existing_cid = _resolve_existing_channel_id(display_name, ids)
+            existing_num = channel_number_by_id.get(existing_cid)
+            allocator.reserve(existing_num)
             if display_name in preserved_names or any(sid in preserved_stream_ids for sid in ids):
                 logger.info(f"[{job.name}] [PRESERVED] [{source}] Kept (below threshold): '{display_name}'")
                 stats["preserved"] += 1
                 _maybe_record(existing_cid, display_name, reason, sort_dt, is_uncertain, identity_title)
-                if current_chan_num is not None:
-                    current_chan_num += 1
                 continue
             logger.info(f"[{job.name}] [SKIPPED] [{source}] Already exists in group: '{display_name}'")
             stats["skipped"] += 1
             _maybe_record(existing_cid, display_name, reason, sort_dt, is_uncertain, identity_title)
-            if current_chan_num is not None:
-                current_chan_num += 1
             continue
 
-        num_info = f" (#{current_chan_num})" if current_chan_num is not None else ""
+        num, num_reason = allocator.next_free(current_chan_num, job_number_end, job.name)
+        if num is None:
+            logger.warning(f"[{job.name}] [NUMBERING] {num_reason} — creating "
+                           f"'{display_name}' with no channel number")
+            stats["unnumbered"] += 1
+            chan_num_to_use = None
+        else:
+            if num_reason.startswith("skipped"):
+                logger.info(f"[{job.name}] [NUMBERING] {num_reason}")
+                stats["number_conflicts"] += 1
+            chan_num_to_use = num
+
+        num_info = f" (#{chan_num_to_use:g})" if chan_num_to_use is not None else " (unnumbered)"
         if dry_run:
             logger.info(f"[{job.name}] [DRY RUN] [{source}] Would create: '{display_name}' | Streams: {ids}{num_info}")
             stats["created"] += 1
+            if chan_num_to_use is not None:
+                allocator.reserve(chan_num_to_use)
+                if number_index is not None:
+                    number_index.add(chan_num_to_use)
+                current_chan_num = chan_num_to_use + 1
         else:
             try:
                 logo_url = None
@@ -2551,14 +3218,33 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                          if (lu := (streams_by_id.get(sid) or {}).get("logo_url"))),
                         None)
                 new_ch = client.create_channel(display_name, ids, target_group_id,
-                                               current_chan_num, tvg_id, logo_url=logo_url)
+                                               chan_num_to_use, tvg_id, logo_url=logo_url)
                 logger.info(f"[{job.name}] [{source}] Created: '{display_name}'{num_info}")
                 stats["created"] += 1
+                if chan_num_to_use is not None:
+                    allocator.reserve(chan_num_to_use)
+                    if number_index is not None:
+                        number_index.add(chan_num_to_use)
+                    current_chan_num = chan_num_to_use + 1
+                if channel_registry is not None:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    registry_channels[str(new_ch["id"])] = {
+                        "job": job.name, "group_id": target_group_id,
+                        "number": chan_num_to_use, "name": display_name,
+                        "identity": (engine.event_identity(identity_title, sort_dt.isoformat())
+                                    if sort_dt else ""),
+                        "title_norm": engine.normalize_event_title(identity_title),
+                        "event_iso": sort_dt.isoformat() if sort_dt else "",
+                        "stream_ids": list(ids), "slot": slot, "source": source,
+                        "adopted": False, "created_at": now_iso, "last_seen_at": now_iso,
+                    }
                 if assign_epg:
                     try:
                         outcome = assign_channel_epg(
                             new_ch["id"], display_name, source, reason, sort_dt,
-                            is_uncertain, tvg_id, epg_src_label, event_duration_hours)
+                            is_uncertain, tvg_id, epg_src_label, event_duration_hours,
+                            identity_title=identity_title,
+                            epg_link_tolerance_minutes=epg_link_tolerance_minutes)
                         logger.info(f"[{job.name}] [EPG-ASSIGN] {outcome}: '{display_name}'")
                     except Exception as e:
                         # EPG is a nicety; never fail the run over it.
@@ -2567,8 +3253,12 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
             except Exception as e:
                 logger.error(f"[{job.name}] [{source}] Failed to create '{display_name}': {e}")
                 stats["errors"] += 1
-        if current_chan_num is not None:
-            current_chan_num += 1
+
+    if channel_registry is not None and not dry_run:
+        try:
+            save_channel_registry(channel_registry, logger)
+        except Exception:
+            logger.exception(f"[{job.name}] [OWNERSHIP] Failed to persist channel registry")
 
     if assign_epg and not dry_run:
         try:

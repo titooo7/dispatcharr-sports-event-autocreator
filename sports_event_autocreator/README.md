@@ -58,7 +58,9 @@ ORM) — no URL, username or password needed.
 | Teamarr watcher: time-shift tolerance (hours, 0 = disable) | Used by the Teamarr watcher only — each job has its own separate setting of the same name for the keyword-EPG path (see *Auto-DVR / Replays* below), not a fallback/inheritance relationship. Default `3`. |
 | Teamarr watcher: max extension (hours, 0 = uncapped) | Used by the Teamarr watcher only — same relationship to the per-job setting as above. Default `2`. |
 | Teamarr watcher: channel groups / title patterns / exclude patterns | Optional watcher that auto-records Teamarr event channels (see *Auto-DVR / Replays* below). Empty groups or empty patterns = off. |
-| Job name for 'Run one job' | Which job the *Run one job* button runs. |
+| Black-screen probe budget (per run) | Total ffmpeg probes allowed per run (default `80`), split **evenly as a guaranteed reserve** across every job with *Skip black-screen streams* enabled, with any leftover pooled as first-come shared surplus. See *Black-screen filtering* below. |
+| EPG link corroboration tolerance (minutes) | How close a real programme's start time must be to a Phase 2 (name-search) event's parsed time to be trusted as a match (default `90`). See *EPG assignment* below. |
+| Job name for 'Run one job' | Which job the *Run one job* button runs (also used by *Adopt channels*). |
 | Job names | Comma-separated list of jobs; drives which per-job field groups exist. |
 
 Changing the interval/cron requires pressing **Apply schedule** (or it will be
@@ -87,6 +89,7 @@ flag mapping:
 | Cleanup old/excluded | `--cleanup` | Delete channels matching excludes or older than *max past hours*. |
 | Only unassigned streams | `--unassigned` | |
 | Starting channel number | `--start-number` | 0 = none. |
+| Ending channel number | — | 0 = unbounded/implied. See *Channel numbering and ranges* below. |
 | Preserve below | `--preserve-below` | 0 = off. With full purge: protects curated channels numbered below N. |
 | Preserve above | — | 0 = off. With full purge: protects channels numbered above N (e.g. 24/7 channels appended at the end of the group). Can be combined with *Preserve below*. |
 | Only today + upcoming / window | `--upcoming --days` | |
@@ -99,6 +102,8 @@ flag mapping:
 | Skip black-screen streams (EPG matches) | — | Probes each candidate stream of an EPG match with ffmpeg; black screens and failed probes are skipped, failing over to the next candidate. Name-search matches are never probed. See *Black-screen filtering* below. |
 | Auto-record: title patterns | — | Opt-in auto-DVR. Record an event channel only when its title matches at least one term (whole-word, same syntax as *Search terms*). Empty = record nothing. One per line. See *Auto-DVR / Replays* below. |
 | Auto-record: exclude patterns | — | Titles matching any of these are never recorded, even if they match a record pattern. One per line. |
+| Update matching channels in place | — | **Off by default.** Phase 1 (EPG) only. See *Channel ownership* below. |
+| Update in place: time-shift tolerance (hours) | — | Only used when the above is on. Default `3`. |
 
 ### Sharing configuration (import / export)
 
@@ -160,13 +165,27 @@ channel gets guide data:
   row — full guide, kept fresh by that source's normal refreshes. The run log
   also states which source each event was found in
   (`[EPG] '…' @ 20:00 08-Jul — found in: EPG Spain, EPG UK-USA`).
-- **Name-search channels** with a reliably parsed time get a single generated
-  guide entry (event title, parsed start time, configurable duration) stored
-  under a plugin-owned EPG source named **"Sports Event Auto-Creator"**. That
-  source appears in M3U & EPG Manager as *inactive* — leave it that way; being
-  inactive is what keeps Dispatcharr's EPG refresh from touching it. The same
-  fallback applies to EPG-search hits whose feed isn't ingested in EPG Manager
-  (external XMLTV URL only).
+- **Name-search channels whose stream carries a `tvg-id`** now also attempt a
+  **corroborated** real-EPG link before falling back to a generated entry: the
+  resolved `EPGData` must be an *active*, non-plugin-synthetic source, **and**
+  it must have an actual programme within **EPG link corroboration tolerance
+  (minutes)** (global setting, default `90`) of the parsed event time **and**
+  that programme's title must also match. Either signal alone is not enough —
+  a provider's self-reported `tvg-id` on a name-search stream is otherwise
+  likely to be its generic 24/7 channel id, which would attach a totally
+  unrelated full-day guide purely because the times happen to line up. When
+  the link isn't corroborated, the run log states why
+  (`[EPG-ASSIGN] Not linking real EPG for '…' (tvg_id '…'): time matched but
+  title did not corroborate (programme title: '…')`) and the channel falls
+  back to the generated single-event entry below.
+- **Name-search channels** with a reliably parsed time (and no corroborated
+  real-EPG link) get a single generated guide entry (event title, parsed
+  start time, configurable duration) stored under a plugin-owned EPG source
+  named **"Sports Event Auto-Creator"**. That source appears in M3U & EPG
+  Manager as *inactive* — leave it that way; being inactive is what keeps
+  Dispatcharr's EPG refresh from touching it. The same fallback applies to
+  EPG-search hits whose feed isn't ingested in EPG Manager (external XMLTV
+  URL only).
 - Channels whose time couldn't be reliably parsed keep `epg_data` unset, so
   Dispatcharr's standard placeholder dummy EPG applies.
 - Guide entries of deleted event channels are cleaned up automatically at the
@@ -218,11 +237,118 @@ Details and caveats:
   budget exhausted) are kept, and never ahead of a confirmed-good stream.
   If every candidate fails, the event is skipped and no channel is created.
 - **Each probe briefly opens one provider connection** (a short ffmpeg pull of
-  the stream URL). Verdicts are cached per stream for the whole run and the
-  number of probes per run is capped, so shared streams are probed once.
+  the stream URL). Verdicts are cached per stream for the whole run, so shared
+  streams are probed once.
+- **Probe budget is per-job, not a single shared pool spent job-by-job.** The
+  global **Black-screen probe budget (per run)** (default `80`) is split
+  *evenly as a guaranteed reserve* across every job that has this toggle on —
+  e.g. 80 across 8 such jobs guarantees 10 probes each — with any leftover
+  from the division pooled as first-come shared surplus any job can draw
+  from once its own reserve is spent. Before this, the budget was a single
+  flat pool consumed in job order, so the *last* job(s) in a run could see it
+  already exhausted by earlier jobs and get zero probes even with plenty of
+  candidates left; each job now gets its own guaranteed share regardless of
+  run order. Once a job's own reserve (plus any remaining surplus) is spent,
+  its remaining candidates for that job are kept unprobed — logged once per
+  job (`[BLACK-CHECK] Probe budget exhausted for this job — remaining
+  candidates kept unprobed`), never once per candidate. The run summary
+  reports the totals (`N black-screen probe(s) (M capped)`).
 - Probing also runs during **Dry run** (it is read-only) so you can preview
   verdicts. Every decision is logged with the `[BLACK-CHECK]` tag, e.g.
   `[BLACK-CHECK] 'Team A vs Team B': stream 'ES: … 20:00' → BLACK (YAVG 16.2) — skipped`.
+
+## Channel numbering and ranges
+
+Every job's channel numbers are drawn from one **instance-wide** pool (a
+number in use anywhere — any `Channel`, and any `ChannelOverride` — is off
+limits, mirroring how Dispatcharr itself reserves numbers), so two jobs can
+never hand out the same number even if their ranges were misconfigured to
+overlap.
+
+- **Ending channel number** (0 = unbounded/implied) caps a job's own range.
+  Leave it at 0 and the job's range is **implied**: it runs from its own
+  *Starting channel number* up to just below the next-higher **enabled**
+  job's starting number — so a "Track & Field" job starting at 260 with no
+  end, and a "Basketball Euroleague" job starting at 270, gives Track & Field
+  an implied range of 260–269 automatically, with **zero configuration
+  changes needed**. The job with the highest starting number (and no end set)
+  is unbounded. Disabled jobs never consume or imply a range.
+- **When a job's range runs out**, it does not silently overflow into a
+  neighboring job's numbers and it does not skip creating the channel either:
+  the channel is created with **no channel number** (visible in Dispatcharr,
+  self-healing the moment a number frees up on a later run), a `WARNING` is
+  logged, and it's counted in the run summary as `N unnumbered`. If you see
+  this, either raise the job's *Ending channel number* / the next job's
+  *Starting channel number*, or accept that the group has more events than
+  numbered slots on a given day.
+- **A skipped-over occupied number** (one job's range containing a number
+  some other channel already holds) is logged at `INFO` and counted as
+  `N number conflict(s) resolved` — the allocator just moves on to the next
+  free number, this is informational, not a problem needing action.
+- **Validate configuration** (and the run summary, once per run) warns about,
+  but never blocks on: two enabled jobs with overlapping *explicit* ranges,
+  a job whose *implied* range is suspiciously narrow (under 20 numbers), two
+  enabled jobs sharing the same channel group, and *Full purge* with neither
+  *Preserve below* nor *Preserve above* set at all. These are warnings, not
+  errors — an existing working config never starts failing runs because of a
+  newly-added check.
+
+## Channel ownership
+
+Historically, a job's cleanup/purge pass only knew about *channel numbers*
+and *names* — it had no concept of *whose* channel something was. Two jobs
+sharing one channel group, or a manually-added channel dropped into a job's
+group, could get deleted by a purge pass that never meant to touch it.
+
+- Every channel the plugin creates (or, from v1.3.0 on, updates in place) is
+  recorded in a durable **channel registry**
+  (`data/plugins/.plugin_state/sports_event_autocreator/channel_registry.json`,
+  the same durable-across-updates location as the DVR tombstones) mapping
+  channel id → owning job, group, number, identity and stream ids. Dispatcharr's
+  `Channel` model has no field the plugin could tag this onto directly, hence
+  the separate file.
+- **Purge/cleanup now checks ownership first**, before any of today's
+  purge_group/cleanup/purge_unmatched rules: a channel with **no** registry
+  entry is always left alone (protects manual channels, and — pre-adoption —
+  everything the plugin already made); a channel owned by **another
+  currently-configured job** (enabled or disabled) is always left alone too,
+  even if that job's own rules would otherwise have deleted it; only a
+  channel owned by **this** job is evaluated by today's rules as before.
+- **One-shot adoption, automatic on upgrade**: the first time a job's target
+  group has zero registry entries, every existing channel in that group is
+  checked against a heuristic — a channel is adopted into that job if its
+  EPG-assigned `tvg-id` matches the plugin's own synthetic pattern
+  (`sea-ch-<id>`), if its name matches the plugin's generated
+  `HH:MM, D-Mon | Title` naming pattern, or if it shares a stream id with
+  something the job prepared this run. Anything matching none of those is
+  left unowned (protects real manual channels) and counted as
+  `N unowned kept`. The pass logs its result loudly
+  (`[OWNERSHIP] Adopted N channel(s) into job 'X'`) and runs at most once per
+  group per run, coordinated across jobs that share a group.
+- **A channel owned by a job whose name has since been removed from the
+  config** is automatically re-adopted into whichever currently-configured
+  job now touches that group (self-correcting — orphaned ownership is never
+  left stranded), counted as `N adopted`.
+- **Adopt channels (job's group)** action: force-runs the same heuristic
+  against the job named in *Job name for 'Run one job'*, even if its group
+  already has ownership tracked — use this if the automatic pass under-adopted
+  something in a group.
+- **Update matching channels in place** (per-job, off by default, Phase 1/EPG
+  only): when on, an EPG event that already has an owned channel — matched by
+  exact identity, or by the same title within *Update in place: time-shift
+  tolerance (hours)* (default `3`) of the owned channel's last-known time —
+  has its streams, name and EPG link updated **in the same channel**, instead
+  of being deleted and recreated. The channel number is **never** changed by
+  this. If the channel has an active or scheduled recording, the stream swap
+  is deferred to a later run (name/EPG still update immediately) and counted
+  as `N stream-swap deferred`; successful updates count as `N updated in
+  place`. Split-mode channels of one event are disambiguated by exact
+  stream-set match, then any shared stream id, then a persisted slot index —
+  never by name alone (several split channels of one event can share an
+  identical display name). Phase 2 (name-search) is unaffected by this
+  setting and always uses the existing delete/recreate behavior — its
+  identity is built from far less stable provider-authored stream names,
+  too risky to match against safely yet.
 
 ## Auto-DVR / Replays
 
@@ -342,7 +468,13 @@ scheduled/ending in the future — it defers that deletion to a later run.
   first whenever "nothing happens".
 - Deletion safety is the same as the script: `purge_group` respects
   `preserve_below`; `purge_unmatched` only deletes channels whose streams are
-  also unmatched, or whose streams were re-used by a newer event.
+  also unmatched, or whose streams were re-used by a newer event — and, from
+  v1.3.0 on, ownership (see *Channel ownership* above) is checked before any
+  of that: a channel not owned by the current job is never touched by it.
 - Files: `plugin.py` (UI glue), `engine.py` (parsing/naming logic),
   `runner.py` (job execution via ORM), `tasks.py` (Celery task + schedule),
-  `jobs.default.json` (default jobs).
+  `jobs.default.json` (default jobs). State files live under
+  `data/plugins/.plugin_state/sports_event_autocreator/`: `auto_dvr_state.json`
+  (DVR tombstones), `last_run.json`, and `channel_registry.json` (channel
+  ownership, v1.3.0+) — this directory survives a plugin update, unlike the
+  plugin's own code directory.

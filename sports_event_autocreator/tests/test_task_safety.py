@@ -274,3 +274,56 @@ def test_genuinely_successful_run_marks_last_success_at(
     last = tasks.read_last_run()
     assert last.get("last_success_at")
     assert last.get("last_success_summary")
+
+
+# --------------------- v1.3.0 new stats keys survive totals fold-in ---------
+# Regression test for the exact class of bug v1.2.0 had to fix once already
+# (a key missing from totals's initial dict gets silently dropped when
+# folding per-job stats in): every new v1.3.0 stats key must both be present
+# in totals's initialization AND actually accumulate from a job's stats dict,
+# with no KeyError anywhere in the fold-in loop.
+
+_NEW_STATS_KEYS = ("probes", "probe_capped", "unnumbered", "number_conflicts",
+                   "unowned_kept", "adopted", "updated", "update_deferred")
+
+
+def test_new_v1_3_0_stats_keys_survive_totals_fold_in(
+        stub_plugin_config, notify_calls, monkeypatch):
+    monkeypatch.setattr(runner, "jobs_from_settings", lambda settings: ([_fake_job()], []))
+    monkeypatch.setattr(runner, "_recording_model", lambda: object())
+    monkeypatch.setattr(runner, "load_auto_dvr_index", lambda model: [])
+    monkeypatch.setattr(runner, "run_teamarr_watch", lambda *a, **k: {
+        "created": 0, "skipped": 0, "errors": 0,
+        "extended": 0, "rescheduled": 0, "capped": 0,
+    })
+    monkeypatch.setattr(runner, "run_retention", lambda *a, **k: {"deleted": 0, "errors": 0})
+    monkeypatch.setattr(runner, "prune_dvr_tombstones", lambda logger: 0)
+
+    per_job_stats = {
+        "prepared": 1, "created": 1, "deleted": 0, "skipped": 0,
+        "preserved": 0, "errors": 0, "recorded": 0, "capped": 0,
+        "extended": 0, "rescheduled": 0, "epg_scanned": 0, "epg_matched": 0,
+        "probes": 3, "probe_capped": 1, "unnumbered": 2, "number_conflicts": 4,
+        "unowned_kept": 5, "adopted": 6, "updated": 7, "update_deferred": 8,
+    }
+    monkeypatch.setattr(runner, "run_job", lambda *a, **k: dict(per_job_stats))
+
+    result = _run_task()  # must not raise KeyError anywhere in the fold-in loop
+    assert result["status"] == "ok"
+
+    last = tasks.read_last_run()
+    job_stats = last["jobs"]["Test Job"]
+    for key in _NEW_STATS_KEYS:
+        assert job_stats[key] == per_job_stats[key]
+
+    summary = last["summary"]
+    for key in _NEW_STATS_KEYS:
+        assert per_job_stats[key] > 0  # sanity: every key actually exercised
+    # The summary string must reflect the new counters, not silently drop them.
+    assert "3 black-screen probe" in summary
+    assert "2 unnumbered" in summary
+    assert "4 number conflict" in summary
+    assert "6 channel(s) adopted" in summary
+    assert "5 unowned channel(s) kept" in summary
+    assert "7 updated in place" in summary
+    assert "8 stream-swap deferred" in summary
