@@ -150,6 +150,31 @@ GLOBAL_FIELDS = [
         ),
     },
     {
+        "id": "record_shift_tolerance_hours",
+        "label": "Teamarr watcher: time-shift tolerance (hours, 0 = disable)",
+        "type": "number",
+        "default": 3,
+        "help_text": (
+            "Used by the Teamarr watcher (each job has its own override of the "
+            "same setting below). When a later run sees the same event at a "
+            "nearby but different time, the existing recording is rescheduled "
+            "in place instead of duplicated, as long as the shift is within "
+            "this many hours. 0 disables this and reverts to exact-time-match."
+        ),
+    },
+    {
+        "id": "record_max_extension_hours",
+        "label": "Teamarr watcher: max extension (hours, 0 = uncapped)",
+        "type": "number",
+        "default": 2,
+        "help_text": (
+            "Used by the Teamarr watcher (each job has its own override of the "
+            "same setting below). Caps how far a recording's end_time can be "
+            "extended past its original end when a longer real EPG span is "
+            "discovered later. 0 = uncapped."
+        ),
+    },
+    {
         "id": "record_teamarr_groups",
         "label": "Teamarr watcher: channel groups (one per line)",
         "type": "text",
@@ -229,21 +254,13 @@ def _saved_settings() -> dict:
         return {}
 
 
-def _active_epg_source_names() -> list:
-    """Names of the active EPG sources in M3U & EPG Manager (unready-DB safe)."""
-    try:
-        from apps.epg.models import EPGSource
-        return list(EPGSource.objects.filter(is_active=True)
-                    .order_by("name").values_list("name", flat=True))
-    except Exception:
-        return []
-
-
 def _epg_source_toggle_fields(job_name: str, settings: dict, active_sources: list) -> list:
     """
     One checkbox per EPG source for this job (tick several to search them all).
     Saved-but-missing sources stay visible so they aren't silently lost, and a
     pre-v1.4 single-select value becomes the ticked default for that source.
+    When "Search all EPG sources" is on for this job, each checkbox's label
+    notes that it is currently ignored.
     """
     legacy = str(settings.get(runner.job_field_id(job_name, "epg_source")) or "").strip()
     if legacy.lower() == runner.EPG_SOURCE_NONE:
@@ -253,6 +270,9 @@ def _epg_source_toggle_fields(job_name: str, settings: dict, active_sources: lis
     saved_sources = [k[len(prefix):] for k in settings if k.startswith(prefix)]
     extra = [s for s in dict.fromkeys(saved_sources + ([legacy] if legacy else []))
              if s and s not in active_sources]
+
+    all_sources_on = bool(settings.get(runner.job_field_id(job_name, "epg_all_sources")))
+    ignored_note = " (ignored while 'Search all EPG sources' is on)" if all_sources_on else ""
 
     fields = []
     for src in list(active_sources) + extra:
@@ -267,7 +287,8 @@ def _epg_source_toggle_fields(job_name: str, settings: dict, active_sources: lis
             "help_text": ("Tick one or more sources; their programmes are read from "
                           "the database and searched together. Takes precedence over "
                           "the XMLTV URL below."
-                          if src == (active_sources[0] if active_sources else src) else ""),
+                          if src == (active_sources[0] if active_sources else src) else "")
+                         + ignored_note,
         })
     return fields
 
@@ -276,7 +297,7 @@ def _build_fields() -> list:
     """Global fields plus one generated group of fields per job."""
     settings = _saved_settings()
     seeds = runner.load_seed_jobs()
-    active_sources = _active_epg_source_names()
+    active_sources = runner.active_epg_source_names()
 
     try:
         names = runner.parse_job_names(settings, seeds)
@@ -297,15 +318,26 @@ def _build_fields() -> list:
             "type": "info",
             "description": f"Settings for the '{name}' job.",
         })
+        toggle_prefix = f"{runner.job_field_id(name, runner.EPG_SOURCE_TOGGLE)}:"
+        has_epgsrc_toggle = any(k.startswith(toggle_prefix) for k in settings)
         for key, ui_type, label, help_text in runner.JOB_FIELD_SPECS:
             if key == "xmltv_url":
                 # EPG-source checkboxes sit directly above the XMLTV URL.
                 fields.extend(_epg_source_toggle_fields(name, settings, active_sources))
+            if key == "epg_all_sources":
+                default = runner.job_ui_default(seeds, name, key)
+                if runner.job_field_id(name, key) not in settings:
+                    # Not a static default: off if this job already has ANY
+                    # saved per-source checkbox (preserves exactly what's
+                    # configured today), on otherwise.
+                    default = not has_epgsrc_toggle
+            else:
+                default = runner.job_ui_default(seeds, name, key)
             field = {
                 "id": runner.job_field_id(name, key),
                 "label": label,
                 "type": "text" if ui_type == "lines" else ui_type,
-                "default": runner.job_ui_default(seeds, name, key),
+                "default": default,
             }
             if help_text:
                 field["help_text"] = help_text
@@ -328,7 +360,7 @@ def _touch_reload_token() -> None:
 
 class Plugin:
     name = "Sports Event Auto-Creator"
-    version = "1.1.10"
+    version = "1.2.0"
     description = (
         "Auto-creates event channels for sports (boxing, MotoGP, Tennis, ...) from "
         "EPG and stream-name searches, with per-sport jobs and a configurable schedule."
@@ -542,7 +574,7 @@ class Plugin:
         data = [runner.job_to_dict(j) for j in jobs]
         text = json.dumps(data, ensure_ascii=False, indent=2)
 
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jobs.export.json")
+        path = os.path.join(runner.plugin_state_dir(), "jobs.export.json")
         file_note = ""
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -654,8 +686,31 @@ class Plugin:
             except ValueError:
                 last_finished = None
             when = last.get("finished_at", "?")
-            desc = last.get("summary") or last.get("reason") or "; ".join(last.get("errors", [])) or last.get("status", "?")
+            status = last.get("status", "?")
+            if status == "crashed":
+                desc = f"CRASHED — {last.get('error') or '?'}"
+            else:
+                desc = last.get("summary") or last.get("reason") or "; ".join(last.get("errors", [])) or status
             parts.append(f"Last run finished {when}: {desc}")
+
+            counts = []
+            for key, label in (("extended", "extended"), ("rescheduled", "rescheduled"),
+                               ("capped", "capped")):
+                total = 0
+                for job_stats in (last.get("jobs") or {}).values():
+                    if isinstance(job_stats, dict):
+                        total += job_stats.get(key, 0) or 0
+                if total:
+                    counts.append(f"{total} {label}")
+            if counts:
+                parts.append(f"Recording reconciliation: {', '.join(counts)}.")
+
+            success_at = last.get("last_success_at")
+            if success_at:
+                parts.append(f"Last successful run: {success_at} "
+                             f"({last.get('last_success_summary') or 'no summary recorded'})")
+            else:
+                parts.append("Last successful run: none recorded yet.")
         else:
             parts.append("Last run: none recorded — the Celery worker has never executed the task.")
 

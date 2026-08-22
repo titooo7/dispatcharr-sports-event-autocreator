@@ -16,6 +16,7 @@ All display times are converted to the configured display timezone
 """
 
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Tuple
 from zoneinfo import ZoneInfo
@@ -790,18 +791,66 @@ def is_channel_too_old(name: str, max_hours: float) -> bool:
         return False
 
 
+_WS_RE = re.compile(r"[\s  ​‌‍﻿]+")
+
+
+def fold_text(s) -> str:
+    """NFKD-fold accents (Fútbol -> match Futbol) and collapse every
+    whitespace variant (including NBSP/zero-width chars scraped XMLTV
+    sometimes contains) to a single ASCII space. Case-preserving --
+    matching stays re.IGNORECASE; keep it that way so this is reusable
+    by the event-identity code below, which lowercases separately.
+
+    Side effect: NFKD folding also strips tildes/cedillas (ñ -> n, ç -> c),
+    so "Peña" folds the same as "Pena". Deliberate: a rare false-positive
+    match is far cheaper than a missed recording of a real game.
+    """
+    if not s:
+        return ""
+    decomposed = unicodedata.normalize("NFKD", s)
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    normalized = unicodedata.normalize("NFC", stripped)
+    return _WS_RE.sub(" ", normalized).strip()
+
+
 def term_matches(term: str, *texts: str) -> bool:
     """Word-boundary term match used consistently by all phases.
 
     A term matches when it appears as a whole word (case-insensitive) in any of
     the given texts. This is the single "search dialect" shared by the exclude
     filter and the record filter, so the user configures one familiar syntax.
+    Both the pattern and every candidate text are accent/whitespace-folded
+    first via fold_text(), so "Futbol" matches "Fútbol" and NBSP-riddled
+    scraped XMLTV titles compare cleanly. The lookaround boundary (rather than
+    \\b...\\b) is deliberately more permissive -- e.g. it matches "##" inside
+    "## Final" -- and is the one canonical matching dialect used everywhere.
     """
     term = (term or "").strip()
     if not term:
         return False
-    pattern = rf"(?<!\w){re.escape(term)}(?!\w)"
-    return any(re.search(pattern, t or "", re.IGNORECASE) for t in texts)
+    folded_term = fold_text(term)
+    if not folded_term:
+        return False
+    pattern = rf"(?<!\w){re.escape(folded_term)}(?!\w)"
+    return any(re.search(pattern, fold_text(t), re.IGNORECASE) for t in texts)
+
+
+def contains_normalized(term: str, text: str) -> bool:
+    """Folded, case-insensitive SUBSTRING test (not word-boundary) -- used by
+    the name-search phase, which needs substring semantics per its own
+    help text."""
+    term = (term or "").strip()
+    if not term:
+        return False
+    return fold_text(term).lower() in fold_text(text or "").lower()
+
+
+def prefix_matches(prefix: str, text: str) -> bool:
+    """Folded startswith() test."""
+    prefix = (prefix or "").strip()
+    if not prefix:
+        return False
+    return fold_text(text or "").lower().startswith(fold_text(prefix).lower())
 
 
 def exclude_matches(term: str, *texts: str) -> bool:
@@ -824,6 +873,112 @@ def record_matches(patterns: List[str], excludes: List[str], *texts: str) -> boo
     if excludes and any(term_matches(x, *texts) for x in excludes):
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Event identity + recording reconciliation
+#
+# These primitives make dedup/extend/reschedule decisions independent of
+# cosmetic display-name formatting (flag emoji, region label, date-prefix
+# toggles) so the keyword-EPG path and the teamarr-watch path converge on the
+# same identity for the same real-world event.
+# ---------------------------------------------------------------------------
+
+def normalize_event_title(title) -> str:
+    """Canonical form of an event title for identity purposes -- fold,
+    casefold, collapse whitespace. Used to build a stable key that
+    survives cosmetic display-formatting differences (flag emoji,
+    date-prefix toggles) between the two recording-creation paths."""
+    return fold_text(title or "").casefold()
+
+
+def event_identity(title, event_iso: str) -> str:
+    """Stable event identity: normalized raw title + exact ISO start.
+    Must always be fed the RAW underlying title (raw EPG programme
+    title, or clean_stream_name's output for the name-search path) --
+    NEVER a formatted display name (format_epg_channel_name /
+    build_name_channel_name output), or per-job cosmetic toggles like
+    country_flags / no_region_label will silently break dedup between
+    two jobs or two runs. This is what makes the keyword-EPG path and
+    the teamarr-watch path converge on the same identity for the same
+    real-world event."""
+    return f"{normalize_event_title(title)}|{event_iso}"
+
+
+RECONCILE_CREATE = "create"
+RECONCILE_SKIP = "skip"
+RECONCILE_EXTEND = "extend"
+RECONCILE_RESCHEDULE = "reschedule"
+RECONCILE_SHIFT_LIVE = "shift_live"
+RECONCILE_TOMBSTONE = "tombstone"
+
+_TERMINAL_STATUSES = {"completed", "stopped", "interrupted", "failed"}
+# Public alias -- runner.py's concurrency-cap count reads this from outside
+# the module.
+TERMINAL_STATUSES = _TERMINAL_STATUSES
+
+
+def decide_recording_action(desired, existing, tombstones, now,
+                             shift_tolerance_hours=3.0,
+                             max_extension_hours=2.0,
+                             legacy_keys=()):
+    """Pure decision function -- no Django, no I/O, fully unit-testable.
+
+    desired: dict with keys "title_norm" (via normalize_event_title),
+        "event_iso" (str), "event_dt" (aware datetime), "start" (aware
+        datetime), "end" (aware datetime).
+    existing: list of plain dicts, each: "pk", "title_norm", "event_iso",
+        "event_dt" (aware datetime), "start" (aware datetime),
+        "end" (aware datetime), "status" (str, may be ""), "event_key"
+        (str, the row's own stored identity key), "channel_id".
+    tombstones: set of key strings the user has deliberately deleted.
+    now: aware datetime.
+    legacy_keys: iterable of extra key strings that should ALSO be
+        treated as an exact match against `desired` (used during the
+        version transition so pre-upgrade rows, keyed on the old
+        display-name-based scheme, aren't falsely treated as new).
+
+    Returns (action, target_pk_or_None, adjusted_end_or_None, reason_str)
+    where action is one of the RECONCILE_* constants above.
+    """
+    desired_key = f"{desired['title_norm']}|{desired['event_iso']}"
+    all_exact_keys = {desired_key, *legacy_keys}
+
+    # 1. Exact key match against any existing row's own event_key,
+    #    OR a key re-derived from that row's stored title_norm+event_iso
+    #    (covers legacy rows that never got an event_key field).
+    for row in existing:
+        row_key = row.get("event_key") or f"{row['title_norm']}|{row['event_iso']}"
+        if row_key in all_exact_keys:
+            if row["status"] in _TERMINAL_STATUSES:
+                return (RECONCILE_SKIP, row["pk"], None, "matched row is terminal, not resurrecting")
+            if row["end"] >= desired["end"]:
+                return (RECONCILE_SKIP, row["pk"], None, "already covers the desired window")
+            original_end = row.get("original_end", row["end"])
+            adjusted = min(desired["end"], original_end + timedelta(hours=max_extension_hours)) \
+                if max_extension_hours > 0 else desired["end"]
+            return (RECONCILE_EXTEND, row["pk"], adjusted, "later end now known")
+
+    # 2. Tolerance-window match: same title, different but nearby time,
+    #    not a terminal row.
+    if shift_tolerance_hours > 0:
+        candidates = [
+            row for row in existing
+            if row["title_norm"] == desired["title_norm"]
+            and row["status"] not in _TERMINAL_STATUSES
+            and abs((row["event_dt"] - desired["event_dt"]).total_seconds()) <= shift_tolerance_hours * 3600
+        ]
+        if candidates:
+            nearest = min(candidates, key=lambda r: abs((r["event_dt"] - desired["event_dt"]).total_seconds()))
+            if nearest["status"] == "recording" or nearest["start"] <= now:
+                return (RECONCILE_SHIFT_LIVE, nearest["pk"], desired["end"], "event time shifted while already capturing")
+            return (RECONCILE_RESCHEDULE, nearest["pk"], desired["end"], "event time shifted, row still pending")
+
+    # 3. Tombstone.
+    if desired_key in tombstones or any(k in tombstones for k in legacy_keys):
+        return (RECONCILE_TOMBSTONE, None, None, "user previously deleted this recording")
+
+    return (RECONCILE_CREATE, None, None, "no match")
 
 
 # ---------------------------------------------------------------------------

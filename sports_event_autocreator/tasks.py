@@ -32,6 +32,7 @@ is materialized as a django_celery_beat PeriodicTask that calls this task.
 import json
 import logging
 import os
+import traceback
 from datetime import datetime, timezone
 
 from celery import shared_task
@@ -41,11 +42,19 @@ TASK_NAME = f"{PLUGIN_KEY}.run_jobs"
 PERIODIC_TASK_NAME = "sports-event-autocreator-run-jobs"
 
 # Written after every task execution; read by the 'Show status' action.
-# Lives next to the plugin code (inside /data) so it survives UI settings
-# saves, which replace the settings dict wholesale.
-LAST_RUN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_run.json")
+# Legacy (pre-1.2.0) in-package location -- _last_run_file_path() below
+# migrates it once to runner.plugin_state_dir(), which survives a plugin
+# re-import (unlike this old location, which the update process wipes).
+_LEGACY_LAST_RUN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_run.json")
 
 logger = logging.getLogger(f"plugins.{PLUGIN_KEY}")
+
+
+def _last_run_file_path() -> str:
+    from . import runner
+    new_path = os.path.join(runner.plugin_state_dir(), "last_run.json")
+    runner._migrate_legacy_state_file(new_path, _LEGACY_LAST_RUN_FILE, logger)
+    return new_path
 
 # ---------------------------------------------------------------------------
 # Workaround for a Dispatcharr/celery interaction bug:
@@ -156,11 +165,32 @@ def check_worker_ready() -> bool:
         return False
 
 
-def _write_last_run(payload: dict) -> None:
+def _write_last_run(payload: dict, mark_success: bool = False) -> None:
+    """Write last_run.json. `last_success_at`/`last_success_summary` are
+    ALWAYS carried forward from whatever was there before, regardless of
+    this call's outcome; only the call site for a genuinely successful full
+    run passes mark_success=True to overwrite them with this run's result.
+    Every other call site (skips, config errors, dry runs, crashes) must
+    leave the last known success alone."""
     try:
+        path = _last_run_file_path()
         payload = dict(payload)
         payload["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        with open(LAST_RUN_FILE, "w", encoding="utf-8") as f:
+
+        prev = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                prev = json.load(f) or {}
+        except Exception:
+            prev = {}
+
+        payload["last_success_at"] = prev.get("last_success_at")
+        payload["last_success_summary"] = prev.get("last_success_summary")
+        if mark_success:
+            payload["last_success_at"] = payload["finished_at"]
+            payload["last_success_summary"] = payload.get("summary") or ""
+
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception:
         logger.debug("Could not write last_run.json", exc_info=True)
@@ -168,7 +198,7 @@ def _write_last_run(payload: dict) -> None:
 
 def read_last_run() -> dict | None:
     try:
-        with open(LAST_RUN_FILE, "r", encoding="utf-8") as f:
+        with open(_last_run_file_path(), "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
@@ -307,16 +337,31 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
     Fired by Celery beat on the user-configured schedule and queued by the
     plugin's UI actions via .delay().
     """
-    from django.db import close_old_connections
-    from django.core.cache import cache
-    from . import engine, runner
-
-    # Non-blocking overlap guard: if a run outlasts the beat interval or "Run
-    # now" is pressed mid-run, two tasks over the same groups race (duplicate
-    # channels, delete/create conflicts). A cache lock lets the second bail out.
+    # Fix (v1.2.0): these three imports used to sit OUTSIDE the try/except
+    # below. If runner.py (or engine.py) itself failed to import -- exactly
+    # the scenario most likely right after a bad plugin update, which is
+    # precisely what the top-level crash handler exists to catch -- the
+    # exception escaped the handler entirely (no last_run.json write, no
+    # notification), and then the `finally` block's use of `cache`/
+    # `close_old_connections` raised a SECOND, unrelated NameError since
+    # neither name was ever bound. Pre-bind both to None so the `finally`
+    # block can never raise NameError regardless of where import/execution
+    # fails, then do the real imports INSIDE the try so any failure there is
+    # caught by the same top-level handler, on every single run (not just
+    # once at plugin-load time).
+    close_old_connections = None
+    cache = None
     lock_key = f"{PLUGIN_KEY}:run_lock"
     lock_acquired = False
     try:
+        from django.db import close_old_connections
+        from django.core.cache import cache
+        from . import engine, runner
+
+        # Non-blocking overlap guard: if a run outlasts the beat interval or
+        # "Run now" is pressed mid-run, two tasks over the same groups race
+        # (duplicate channels, delete/create conflicts). A cache lock lets
+        # the second bail out.
         try:
             lock_acquired = bool(cache.add(
                 lock_key, datetime.now(timezone.utc).isoformat(), timeout=1800))
@@ -410,11 +455,26 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
         record_post_pad_min = max(0.0, _num("record_post_pad_min", 30))
         retention_days = int(max(0.0, _num("replay_retention_days", 14)))
         max_simultaneous_recordings = int(max(0.0, _num("max_simultaneous_recordings", 2)))
+        # Teamarr-watch isn't tied to one job, so it uses these GLOBAL
+        # settings (per-job jobs use their own record_shift_tolerance_hours/
+        # record_max_extension_hours override -- see runner.JOB_FIELD_SPECS).
+        teamarr_shift_tolerance_hours = max(0.0, _num("record_shift_tolerance_hours", 3))
+        teamarr_max_extension_hours = max(0.0, _num("record_max_extension_hours", 2))
 
         xmltv_cache = {}
         totals = {"prepared": 0, "created": 0, "deleted": 0,
-                  "skipped": 0, "preserved": 0, "errors": 0, "recorded": 0}
+                  "skipped": 0, "preserved": 0, "errors": 0, "recorded": 0,
+                  "capped": 0, "extended": 0, "rescheduled": 0,
+                  "epg_scanned": 0, "epg_matched": 0}
         per_job = {}
+
+        # One auto-DVR index snapshot for the whole run (not one per job) --
+        # see load_auto_dvr_index()/ensure_recording() in runner.py. Updated
+        # in place by every ensure_recording() call below (jobs AND the
+        # teamarr watcher) so two matches for the same event within this one
+        # run still dedup against each other.
+        dvr_index = runner.load_auto_dvr_index(runner._recording_model())
+
         for job in jobs:
             try:
                 stats = runner.run_job(job, logger, dry_run=dry_run, xmltv_cache=xmltv_cache,
@@ -424,7 +484,8 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
                                        probe_state=probe_state,
                                        record_pre_pad_min=record_pre_pad_min,
                                        record_post_pad_min=record_post_pad_min,
-                                       max_simultaneous_recordings=max_simultaneous_recordings)
+                                       max_simultaneous_recordings=max_simultaneous_recordings,
+                                       dvr_index=dvr_index)
                 per_job[job.name] = stats
                 for k in totals:
                     totals[k] += stats.get(k, 0)
@@ -442,39 +503,85 @@ def run_jobs_task(job_name: str = "", dry_run: bool = False) -> dict:
                 runner._as_lines(settings.get("record_teamarr_exclude")),
                 logger, dry_run, event_duration_hours,
                 record_pre_pad_min, record_post_pad_min,
-                max_simultaneous=max_simultaneous_recordings)
+                max_simultaneous=max_simultaneous_recordings,
+                dvr_index=dvr_index,
+                shift_tolerance_hours=teamarr_shift_tolerance_hours,
+                max_extension_hours=teamarr_max_extension_hours)
             totals["recorded"] += teamarr_stats.get("created", 0)
+            totals["extended"] += teamarr_stats.get("extended", 0)
+            totals["rescheduled"] += teamarr_stats.get("rescheduled", 0)
+            totals["capped"] += teamarr_stats.get("capped", 0)
             totals["errors"] += teamarr_stats.get("errors", 0)
-        except Exception:
+        except Exception as e:
             logger.exception("Teamarr watcher failed")
+            totals["errors"] += 1
+            per_job["__teamarr__"] = {"error": str(e)}
 
         # Retention: prune aged / failed auto-DVR recordings (files + rows).
         retention_stats = None
         try:
             retention_stats = runner.run_retention(retention_days, logger, dry_run)
-        except Exception:
+        except Exception as e:
             logger.exception("Retention pass failed")
+            totals["errors"] += 1
+            per_job["__retention__"] = {"error": str(e)}
+
+        # Tombstone/creation-state pruning: once per full run, not once per
+        # created recording (see prune_dvr_tombstones()'s docstring).
+        if not dry_run:
+            try:
+                runner.prune_dvr_tombstones(logger)
+            except Exception:
+                logger.exception("Tombstone pruning failed")
 
         prefix = "[DRY RUN] " if dry_run else ""
         summary = (f"{prefix}Sports Auto-Creator: {totals['created']} created, "
                    f"{totals['deleted']} deleted, {totals['skipped']} skipped, "
-                   f"{totals['recorded']} recorded "
-                   f"across {len(jobs)} job(s)"
+                   f"{totals['recorded']} recorded, {totals['extended']} extended, "
+                   f"{totals['rescheduled']} rescheduled, "
+                   f"{totals['capped']} capped (max_simultaneous) "
+                   f"across {len(jobs)} job(s) — considered {totals['prepared']} "
+                   f"event(s), scanned {totals['epg_scanned']} EPG programme(s), "
+                   f"{totals['epg_matched']} matched"
                    + (f", {retention_stats['deleted']} recording(s) pruned"
                       if retention_stats and retention_stats.get("deleted") else "")
                    + (f" — {totals['errors']} error(s)" if totals['errors'] else "")
                    + (f" — {len(config_errors)} misconfigured job(s) skipped"
                       if config_errors else ""))
         logger.info(summary)
-        _notify(summary, success=totals["errors"] == 0 and not config_errors,
+        run_success = totals["errors"] == 0 and not config_errors
+        _notify(summary, success=run_success,
                 refresh_channels=not dry_run and (totals["created"] > 0 or totals["deleted"] > 0))
 
         _write_last_run({"status": "ok", "dry_run": dry_run, "job_name": job_name,
-                         "summary": summary, "jobs": per_job, "errors": config_errors})
+                         "summary": summary, "jobs": per_job, "errors": config_errors},
+                        mark_success=run_success and not dry_run)
         return {"status": "ok", "summary": summary, "jobs": per_job}
+    except Exception as e:
+        # Top-level safety net: anything that escapes every per-job/per-
+        # teamarr/per-retention try/except above (a bug in the orchestration
+        # itself, not in one job) still gets a write, a notification, and a
+        # status distinct from a normal per-job "error" -- so the status
+        # display can tell "one job misconfigured" apart from "the whole run
+        # blew up".
+        logger.exception("Sports Auto-Creator: task crashed")
+        _write_last_run({
+            "status": "crashed",
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc()[-4000:],
+            "dry_run": dry_run,
+            "job_name": job_name,
+        })
+        _notify("Sports Auto-Creator: the run CRASHED — see the celery log", success=False)
+        return {"status": "crashed", "message": str(e)}
     finally:
-        close_old_connections()
-        if lock_acquired:
+        # `close_old_connections`/`cache` may still be None if the import
+        # itself is what failed (see the top of the function) -- guard both
+        # so this block can never itself raise NameError on top of whatever
+        # already went wrong.
+        if close_old_connections is not None:
+            close_old_connections()
+        if lock_acquired and cache is not None:
             try:
                 cache.delete(lock_key)
             except Exception:

@@ -1,6 +1,6 @@
 {
   "name": "Sports Event Auto-Creator",
-  "version": "1.1.10",
+  "version": "1.2.0",
   "description": "Auto-creates event channels for sports (Boxing, Track Field, MotoGP and other sports, ...) from EPG and stream-name searches, with per-sport jobs edited in the UI and a configurable schedule.",
   "author": "titooo7",
   "fields": [
@@ -93,6 +93,20 @@
       "type": "number",
       "default": 2,
       "help_text": "Caps how many recordings (any origin, manual or auto) may be airing at once. Recordings whose status marks them dead (interrupted/failed/stopped/completed) do not occupy a slot. Extra matches beyond the cap are skipped and logged, not queued."
+    },
+    {
+      "id": "record_shift_tolerance_hours",
+      "label": "Teamarr watcher: time-shift tolerance (hours, 0 = disable)",
+      "type": "number",
+      "default": 3,
+      "help_text": "Used by the Teamarr watcher (each job has its own override of the same setting below). When a later run sees the same event at a nearby but different time, the existing recording is rescheduled in place instead of duplicated, as long as the shift is within this many hours. 0 disables this and reverts to exact-time-match."
+    },
+    {
+      "id": "record_max_extension_hours",
+      "label": "Teamarr watcher: max extension (hours, 0 = uncapped)",
+      "type": "number",
+      "default": 2,
+      "help_text": "Used by the Teamarr watcher (each job has its own override of the same setting below). Caps how far a recording's end_time can be extended past its original end when a longer real EPG span is discovered later. 0 = uncapped."
     },
     {
       "id": "record_teamarr_groups",

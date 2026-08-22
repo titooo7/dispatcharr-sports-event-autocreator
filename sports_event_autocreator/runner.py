@@ -11,6 +11,7 @@ as required by the Dispatcharr plugin guidelines.
 
 import gzip
 import json
+import logging
 import os
 import re
 import shutil
@@ -44,6 +45,7 @@ class JobRuntimeError(Exception):
 
 JOB_DEFAULTS = {
     "enabled": True,
+    "epg_all_sources": False,   # search every active EPG source, ignoring the checkboxes
     "epg_sources": [],          # names of Dispatcharr EPG sources (win over xmltv_url)
     "xmltv_url": "",            # optional; Phase 1 skipped when both are empty
     "search": [],               # list of search terms
@@ -76,6 +78,8 @@ JOB_DEFAULTS = {
     "record_patterns": [],      # auto-DVR: record events whose title matches ANY of these
     "record_exclude": [],       # auto-DVR: ...and NONE of these (opt-in; empty = record nothing)
     "record_duration_hours": 0,  # auto-DVR: length when the EPG has none (0 = global default)
+    "record_shift_tolerance_hours": 3.0,  # auto-DVR: time-shift reconciliation window (0 = disable)
+    "record_max_extension_hours": 2.0,    # auto-DVR: cap on extending a recording's end (0 = uncapped)
 }
 
 _LIST_KEYS = {"search", "exclude", "exclude_stream_prefixes", "pin_top", "epg_sources",
@@ -175,6 +179,10 @@ JOB_FIELD_SPECS = [
      "Untick to skip this job without deleting its configuration."),
     ("group",            "string",  "Channel group",
      "Target channel group (created automatically if missing). Required."),
+    ("epg_all_sources",  "boolean", "Search all EPG sources",
+     "Search every active EPG source in M3U & EPG Manager, ignoring the "
+     "per-source checkboxes below. Useful so a job isn't silently blind to "
+     "an EPG source added after it was configured."),
     ("xmltv_url",        "string",  "XMLTV URL",
      "Optional. External XMLTV URL (or a file path under /data) for the EPG "
      "search phase. Fetched once per run even if several jobs share it."),
@@ -246,6 +254,21 @@ JOB_FIELD_SPECS = [
      "unknown — name-search events, or EPG matches without an end time. "
      "0 = use the global 'Generated event programme duration'. When the EPG "
      "provides the programme's real length, that always wins over this."),
+    ("record_shift_tolerance_hours", "number",
+     "Auto-record: time-shift tolerance (hours, 0 = disable)",
+     "When a later run sees the same event's title at a nearby but "
+     "different time (a broadcaster time-shift), the existing recording is "
+     "rescheduled in place instead of creating a duplicate, as long as the "
+     "shift is within this many hours. 0 disables this reconciliation "
+     "entirely and reverts to the old exact-time-match-only behavior (a "
+     "time-shifted event creates a second recording)."),
+    ("record_max_extension_hours", "number",
+     "Auto-record: max extension (hours, 0 = uncapped)",
+     "When a later run discovers a longer real EPG span for an "
+     "already-created recording, its end_time is extended -- capped at this "
+     "many hours past the original end, so a bad EPG value can't schedule a "
+     "runaway-length capture. 0 = uncapped (extend to whatever the EPG now "
+     "says)."),
 ]
 
 PURGE_MODE_OPTIONS = [
@@ -335,13 +358,31 @@ def _as_number(value, default=0.0) -> float:
         return default
 
 
-def job_from_settings(settings: dict, name: str, seeds: Dict[str, dict]) -> SimpleNamespace:
-    """Assemble one job from the flat per-job settings keys."""
+def job_from_settings(settings: dict, name: str, seeds: Dict[str, dict],
+                      active_epg_sources: Optional[List[str]] = None) -> SimpleNamespace:
+    """Assemble one job from the flat per-job settings keys.
+
+    ``active_epg_sources``: the run's already-resolved active_epg_source_names()
+    result, passed down so it is queried once per run rather than once per
+    job. When None (e.g. standalone/test use), it is resolved lazily here
+    only if a job actually needs it (epg_all_sources on).
+    """
     cfg = {"name": name}
+    toggle_prefix = f"{job_field_id(name, EPG_SOURCE_TOGGLE)}:"
+    has_epgsrc_toggle = any(k.startswith(toggle_prefix) for k in settings)
+
     for key, ui_type, _label, _help in JOB_FIELD_SPECS:
         value = settings.get(job_field_id(name, key))
         if value is None:
-            value = job_ui_default(seeds, name, key)
+            if key == "epg_all_sources":
+                # Not a static default: False if this job already has ANY
+                # saved per-source checkbox (preserves exactly what's
+                # configured today, no surprise widening on upgrade), True
+                # otherwise (turns EPG search on by default for a job that's
+                # never had its checkboxes individually saved).
+                value = not has_epgsrc_toggle
+            else:
+                value = job_ui_default(seeds, name, key)
 
         if key == "purge_mode":
             cfg["purge_group"] = value == "purge_group"
@@ -354,6 +395,8 @@ def job_from_settings(settings: dict, name: str, seeds: Dict[str, dict]) -> Simp
         elif key == "record_duration_hours":
             num = _as_number(value, 0)
             cfg[key] = min(num, 12.0) if num > 0 else 0  # 0 = auto, clamp 12h
+        elif key in ("record_shift_tolerance_hours", "record_max_extension_hours"):
+            cfg[key] = max(_as_number(value, JOB_DEFAULTS[key]), 0.0)
         elif key == "days":
             cfg[key] = max(int(_as_number(value, JOB_DEFAULTS["days"])), 1)
         elif key == "max_split":
@@ -363,23 +406,41 @@ def job_from_settings(settings: dict, name: str, seeds: Dict[str, dict]) -> Simp
         else:
             cfg[key] = str(value or "").strip()
 
-    # EPG sources come from per-source checkboxes (job:<name>:epgsrc:<source>).
-    # If no checkbox key exists at all (settings saved before v1.4.0), fall
-    # back to the old single-select value; once any checkbox has been saved,
-    # the checkboxes are authoritative (all-unticked means "no EPG source").
-    toggle_prefix = f"{job_field_id(name, EPG_SOURCE_TOGGLE)}:"
-    toggle_keys = [k for k in settings if k.startswith(toggle_prefix)]
-    if toggle_keys:
-        cfg["epg_sources"] = sorted(k[len(toggle_prefix):] for k in toggle_keys
-                                    if settings.get(k))
+    # EPG sources: if "Search all EPG sources" is on for this job, use every
+    # active source and skip the per-checkbox resolution entirely (individual
+    # checkboxes are ignored while this is on). Otherwise fall back to the
+    # per-source checkboxes (job:<name>:epgsrc:<source>); if none exist at all
+    # (settings saved before v1.4.0), fall back to the old single-select
+    # value — once any checkbox has been saved, the checkboxes are
+    # authoritative (all-unticked means "no EPG source").
+    if cfg.get("epg_all_sources"):
+        sources = active_epg_sources if active_epg_sources is not None else active_epg_source_names()
+        cfg["epg_sources"] = list(sources)
     else:
-        legacy = str(settings.get(job_field_id(name, "epg_source")) or "").strip()
-        if legacy and legacy.lower() != EPG_SOURCE_NONE:
-            cfg["epg_sources"] = [legacy]
+        toggle_keys = [k for k in settings if k.startswith(toggle_prefix)]
+        if toggle_keys:
+            cfg["epg_sources"] = sorted(k[len(toggle_prefix):] for k in toggle_keys
+                                        if settings.get(k))
         else:
-            cfg["epg_sources"] = list(_seed_value(seeds, name, "epg_sources") or [])
+            legacy = str(settings.get(job_field_id(name, "epg_source")) or "").strip()
+            if legacy and legacy.lower() != EPG_SOURCE_NONE:
+                cfg["epg_sources"] = [legacy]
+            else:
+                cfg["epg_sources"] = list(_seed_value(seeds, name, "epg_sources") or [])
 
     return normalize_job(cfg)
+
+
+def active_epg_source_names() -> List[str]:
+    """Names of the active EPG sources in M3U & EPG Manager (unready-DB
+    safe). Single implementation shared by plugin.py's per-source checkbox
+    UI and the epg_all_sources resolution above."""
+    try:
+        from apps.epg.models import EPGSource
+        return list(EPGSource.objects.filter(is_active=True)
+                    .order_by("name").values_list("name", flat=True))
+    except Exception:
+        return []
 
 
 def job_to_dict(job: SimpleNamespace) -> dict:
@@ -436,10 +497,11 @@ def jobs_from_settings(settings: dict) -> Tuple[List[SimpleNamespace], List[str]
     except JobConfigError as e:
         return [], [str(e)]
 
+    active_sources = active_epg_source_names()
     jobs = []
     for name in names:
         try:
-            jobs.append(job_from_settings(settings, name, seeds))
+            jobs.append(job_from_settings(settings, name, seeds, active_sources))
         except JobConfigError as e:
             errors.append(
                 f"{e} — if you just added this job, press 'Reload job fields', "
@@ -706,30 +768,91 @@ def assign_channel_epg(channel_id: int, display_name: str, source: str,
 # the user's manual DVR recordings (which must never be touched).
 AUTO_DVR_TAG = "auto_dvr"
 
-# Plugin-private state for the auto-DVR feature (tombstones). Lives next to
-# the plugin code under /data so it survives container rebuilds. chmod 666
-# after writing: celery runs as root while manual runs may execute as the
-# web user, and either must be able to rewrite it.
-_DVR_STATE_FILE = os.path.join(
+# Legacy (pre-1.2.0) in-package state location. Still read once, as a
+# one-shot migration source, by _load_dvr_state()/_load_last_run() below.
+_LEGACY_DVR_STATE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "auto_dvr_state.json")
+
+_STATE_DIR_FALLBACK_WARNED = False
+
+
+def plugin_state_dir() -> str:
+    """Directory for state that must survive a plugin re-import (which
+    os.rename's the whole plugin package directory aside and deletes it --
+    confirmed in Dispatcharr's apps/plugins/api_views.py). Checked in order:
+    DISPATCHARR_PLUGINS_DIR env var, then PLUGINS_DIR env var, then the
+    hardcoded default "/data/plugins" -- matching Dispatcharr's own loader
+    default. Creates <plugins_dir>/.plugin_state/sports_event_autocreator/
+    (a dot-prefixed directory the plugin loader ignores, since it lacks
+    plugin.py/__init__.py). On any failure to create/access it, falls back
+    to the old in-package location and logs a WARNING once (degraded, not
+    fatal -- state just won't survive the next update).
+    """
+    global _STATE_DIR_FALLBACK_WARNED
+    plugins_dir = (os.environ.get("DISPATCHARR_PLUGINS_DIR")
+                   or os.environ.get("PLUGINS_DIR")
+                   or "/data/plugins")
+    state_dir = os.path.join(plugins_dir, ".plugin_state", "sports_event_autocreator")
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        return state_dir
+    except Exception:
+        if not _STATE_DIR_FALLBACK_WARNED:
+            _STATE_DIR_FALLBACK_WARNED = True
+            logging.getLogger(f"plugins.sports_event_autocreator").warning(
+                f"[STATE] Could not create/access {state_dir} -- falling back "
+                f"to the in-package state location (degraded: state won't "
+                f"survive a plugin update)")
+        return os.path.dirname(os.path.abspath(__file__))
+
+
+def _migrate_legacy_state_file(new_path: str, legacy_path: str, logger=None) -> None:
+    """One-shot migration: if `new_path` doesn't exist yet but `legacy_path`
+    does, copy it over. Never deletes the legacy file (the plugin-update
+    process is about to wipe the whole old package directory anyway)."""
+    if os.path.exists(new_path) or not os.path.exists(legacy_path):
+        return
+    try:
+        with open(legacy_path, encoding="utf-8") as f:
+            legacy_data = f.read()
+        tmp = new_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(legacy_data)
+        os.replace(tmp, new_path)
+        try:
+            os.chmod(new_path, 0o666)
+        except OSError:
+            pass
+        if logger is not None:
+            logger.info(f"[STATE] Migrated {os.path.basename(legacy_path)} to {new_path}")
+    except Exception:
+        pass
+
+
+def _dvr_state_file_path() -> str:
+    return os.path.join(plugin_state_dir(), "auto_dvr_state.json")
 
 
 def _event_key(title: str, event_iso: str) -> str:
     """Stable identity of a real-world event: normalized title + start time.
 
-    Recording dedup must key on the event itself, never on channel_id:
-    duplicate provider feeds surface as separate channels with identical
-    display names, and purge_group recreates channels with fresh ids every
-    run, so a channel_id-based dedup re-records the same broadcast once per
-    duplicate feed and once per recreation.
+    This is the OLD (pre-1.2.0) scheme, built from whatever cosmetic display
+    title the caller passed at the time (country flag / region label / date
+    prefix all baked in) -- kept ONLY so ensure_recording can recognize
+    pre-upgrade rows during the version transition (see its `legacy_key`
+    computation). New rows use engine.event_identity() instead, which is
+    built from the raw, un-formatted title and so survives per-job cosmetic
+    toggles being flipped.
     """
     norm = re.sub(r"\s+", " ", (title or "").strip().lower())
     return f"{norm}|{event_iso}"
 
 
-def _load_dvr_state() -> Dict:
+def _load_dvr_state(logger=None) -> Dict:
+    new_path = _dvr_state_file_path()
+    _migrate_legacy_state_file(new_path, _LEGACY_DVR_STATE_FILE, logger)
     try:
-        with open(_DVR_STATE_FILE, encoding="utf-8") as f:
+        with open(new_path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get("created"), dict):
             return data
@@ -739,126 +862,464 @@ def _load_dvr_state() -> Dict:
 
 
 def _save_dvr_state(state: Dict, logger) -> None:
+    new_path = _dvr_state_file_path()
     try:
-        tmp = _DVR_STATE_FILE + ".tmp"
+        tmp = new_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f)
-        os.replace(tmp, _DVR_STATE_FILE)
+        os.replace(tmp, new_path)
         try:
-            os.chmod(_DVR_STATE_FILE, 0o666)
+            os.chmod(new_path, 0o666)
         except OSError:
             pass
     except Exception as e:
         logger.warning(f"[DVR] Could not persist auto-DVR state "
                        f"(user-deletion tombstones degraded): {e}")
 
+
+_TOMBSTONE_MAX_ENTRIES = 5000
+
+
+def prune_dvr_tombstones(logger) -> int:
+    """Prune the creation/tombstone state once per full task run (not once
+    per created recording, as before): drop entries whose event ended 2+
+    days ago, then hard-cap at the newest _TOMBSTONE_MAX_ENTRIES by end-time
+    so the file can't grow unbounded. Returns the number of entries kept."""
+    state = _load_dvr_state(logger)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=2)
+
+    def _end_dt(entry):
+        try:
+            return datetime.fromisoformat(entry.get("end", ""))
+        except (ValueError, TypeError):
+            return None
+
+    created = {}
+    for k, v in state.get("created", {}).items():
+        dt = _end_dt(v)
+        if dt is not None and dt > cutoff:
+            created[k] = v
+
+    if len(created) > _TOMBSTONE_MAX_ENTRIES:
+        ranked = sorted(created.items(),
+                        key=lambda kv: _end_dt(kv[1]) or datetime.min.replace(tzinfo=timezone.utc),
+                        reverse=True)
+        created = dict(ranked[:_TOMBSTONE_MAX_ENTRIES])
+
+    state["created"] = created
+    _save_dvr_state(state, logger)
+    return len(created)
+
+
+def _recording_model():
+    """Seam for tests: monkeypatch this to return a fake model instead of
+    the real Django one, without needing Django/Postgres installed."""
+    from apps.channels.models import Recording
+    return Recording
+
 # File-cleanup roots, mirroring the fork's RecordingViewSet.destroy semantics
 # (apps/channels/api_views.py). ORM .delete() only removes the row, so we
 # delete the media files first and then prune now-empty parent directories.
 _RECORDINGS_ROOT = os.path.normpath("/data/recordings")
-_ALLOWED_FILE_ROOTS = ("/data/",)
+
+
+def _under_recordings_root(path) -> bool:
+    """True only if `path` IS the recordings root or a real descendant of it
+    (normpath'd first, so a '..'-escape like '/data/recordings/../logos'
+    correctly evaluates to False rather than string-prefix-matching)."""
+    if not path or not isinstance(path, str):
+        return False
+    p = os.path.normpath(path)
+    return p == _RECORDINGS_ROOT or p.startswith(_RECORDINGS_ROOT + os.sep)
+
+
+class DvrIndex(list):
+    """List of load_auto_dvr_index() entries, plus one extra attribute:
+    ``unknown_channel_ids`` -- the set of channel_ids that have a
+    plugin-owned (auto_dvr-tagged) Recording we could NOT parse a usable
+    event_start out of. Those rows can't be reconciled by
+    decide_recording_action (it needs an event_dt), but pre-1.2.0 code
+    still used them as a same-channel dedup fallback: ``if rec.channel_id
+    == channel_id and cp.get("event_start") is None: return False``
+    (suppress the duplicate). ensure_recording() re-implements that same
+    fallback by checking this set. A plain list subclass so every existing
+    ``for row in index`` / ``index.append(...)`` / ``len(index)`` call site
+    keeps working unchanged."""
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.unknown_channel_ids = set()
+
+
+def load_auto_dvr_index(recording_model) -> "DvrIndex":
+    """One lightweight snapshot of every plugin-owned (auto_dvr-tagged)
+    Recording, built once per run. Each entry: pk, title_norm, event_iso,
+    event_dt (parsed from custom_properties.event_start), start, end,
+    status, event_key, channel_id, original_end.
+
+    Deliberately loads and filters in Python rather than querying
+    custom_properties via the ORM's JSONField lookups (the suspected NULL-
+    handling gap this task's ground truth flags) -- a full read of every
+    Recording row once per run is cheap and side-steps the ambiguity
+    entirely.
+
+    Rows that can't be parsed into a full entry (no valid event_start) are
+    NOT silently dropped: their channel_id is recorded in the returned
+    DvrIndex's ``unknown_channel_ids`` set instead, so ensure_recording can
+    still treat them as a same-channel dedup blocker (see DvrIndex's
+    docstring).
+    """
+    entries = DvrIndex()
+    qs = recording_model.objects.only(
+        "id", "channel_id", "start_time", "end_time", "custom_properties")
+    for rec in qs:
+        cp = rec.custom_properties or {}
+        if not cp.get(AUTO_DVR_TAG):
+            continue
+        event_iso = cp.get("event_start") or ""
+        try:
+            event_dt = datetime.fromisoformat(event_iso) if event_iso else None
+        except ValueError:
+            event_dt = None
+        if event_dt is None:
+            entries.unknown_channel_ids.add(rec.channel_id)
+            continue  # can't reconcile a row with no known event time
+
+        title_norm = cp.get("event_title_norm")
+        if not title_norm:
+            raw_title = ((cp.get("program") or {}).get("title") or "")
+            title_norm = engine.normalize_event_title(raw_title)
+
+        original_end = rec.end_time
+        if cp.get("original_end"):
+            try:
+                original_end = datetime.fromisoformat(cp["original_end"])
+            except ValueError:
+                pass
+
+        entries.append({
+            "pk": rec.id,
+            "title_norm": title_norm,
+            "event_iso": event_iso,
+            "event_dt": event_dt,
+            "start": rec.start_time,
+            "end": rec.end_time,
+            "status": cp.get("status") or "",
+            "event_key": cp.get("event_key") or "",
+            "channel_id": rec.channel_id,
+            "original_end": original_end,
+        })
+    return entries
+
+
+def _count_overlapping_recordings(recording_model, start, end) -> int:
+    """Concurrency-cap count: ALL Recording rows -- ANY origin, plugin-owned
+    (auto_dvr-tagged) or manual -- whose window overlaps [start, end),
+    excluding rows whose status marks them dead (see
+    engine.TERMINAL_STATUSES). This is deliberately a SEPARATE, targeted
+    query from load_auto_dvr_index()'s snapshot: that index is filtered to
+    plugin-owned rows only, which is correct for the dedup/reconciliation
+    logic (decide_recording_action) but wrong for the cap -- the plugin's
+    own settings help text promises "any origin, manual or auto", and a
+    manual DVR recording must still consume a concurrency slot.
+
+    Deliberately a plain ``.filter()`` plus a Python-side status check, NOT
+    the ORM ``.exclude(custom_properties__status__in=[...])`` pattern --
+    that pattern is suspected of a Django JSONField NULL-handling gap that
+    silently drops rows with no "status" key in custom_properties at all
+    (see the regression test this fix ships with).
+    """
+    qs = recording_model.objects.filter(start_time__lt=end, end_time__gt=start)
+    count = 0
+    for rec in qs:
+        cp = rec.custom_properties or {}
+        status = cp.get("status") or ""
+        if status in engine.TERMINAL_STATUSES:
+            continue
+        count += 1
+    return count
+
+
+class _ActionResult(str):
+    """A plain ensure_recording() result string ("created", "capped", ...)
+    that can ALSO carry ``also_extended = True`` -- lets both existing call
+    sites keep their simple ``result == "created"`` / ``result in (...)``
+    comparisons and ``stats[result] += 1`` pattern completely unchanged,
+    while still letting a shift_live event (which extends the still-live
+    original AND creates/caps a second recording in the same call) report
+    BOTH outcomes back to the caller for accurate stats. A str subclass
+    compares/hashes exactly like the plain string; the extra attribute
+    rides along for callers that check it via ``getattr(result,
+    "also_extended", False)`` (safe default for every other plain-string
+    result)."""
+    also_extended = False
+
+
+def _result(action: str, also_extended: bool = False) -> _ActionResult:
+    r = _ActionResult(action)
+    r.also_extended = also_extended
+    return r
+
+
+def _index_update(index: List[Dict], pk, **fields) -> None:
+    """Update the in-memory index entry for `pk` in place, so a second
+    ensure_recording() call in the SAME run sees the effect of the first
+    (not just what's in the fake/real DB) -- otherwise two matches within
+    one run would both see "no match" and create duplicates."""
+    for row in index:
+        if row["pk"] == pk:
+            row.update(fields)
+            return
 
 
 def ensure_recording(channel_id: int, event_start_utc_naive: datetime,
                      duration_hours: float, pre_pad_min: float,
                      post_pad_min: float, tag_props: Dict, logger,
-                     max_simultaneous: int = 0) -> bool:
-    """Create an auto-DVR Recording for an event channel unless one already
-    exists for the same event. Returns True if a recording was created.
+                     max_simultaneous: int = 0,
+                     identity_title: Optional[str] = None,
+                     legacy_keys: Tuple[str, ...] = (),
+                     shift_tolerance_hours: float = 3.0,
+                     max_extension_hours: float = 2.0,
+                     index: Optional[List[Dict]] = None) -> str:
+    """Reconcile one desired event recording against existing auto-DVR rows
+    and act on it: create / skip / extend / reschedule / cap / tombstone.
+
+    Returns a str-like _ActionResult (compares/hashes exactly like a plain
+    str) that is one of: "created", "skipped", "extended", "rescheduled",
+    "capped", "tombstoned" ("shift_live" is never returned as its own value
+    -- it always falls through to "created"/"capped"/"skipped"). It also
+    carries `.also_extended` (default False): True when a shift_live event
+    ALSO extended the still-live original recording in this same call, so a
+    caller can increment stats["extended"] in addition to whatever the
+    primary action already counted (see _result()'s docstring).
 
     ``event_start_utc_naive`` is naive UTC (as produced by the run loop's
     sort_dt); it is made timezone-aware UTC before storing so Dispatcharr's
-    signal interprets it correctly. Dedup keys on
-    custom_properties.event_start (identity), NEVER on the padded start_time —
-    which shifts when the pre-pad setting changes and would double-book.
+    signal interprets it correctly.
 
-    ``max_simultaneous`` (0 = unlimited) caps how many recordings (any origin,
-    manual or auto) may be airing at once — genuinely distinct events can
-    overlap, and the provider's concurrent-stream budget is finite. Rows whose
-    status marks them dead (interrupted/failed/stopped/completed) do not
-    occupy a slot.
+    ``identity_title`` is the RAW underlying title (raw EPG programme title,
+    or clean_stream_name's output for the name-search path) used to build
+    the event's stable identity -- NEVER the cosmetic display name (which
+    carries flag emoji / region label / date-prefix toggles that would
+    otherwise silently break dedup between two jobs or two runs). Falls back
+    to tag_props's display title when not given (teamarr-watch and any other
+    legacy caller).
 
-    Dedup is by **event identity** (normalized title + event_start), checked
-    across ALL auto_dvr recordings regardless of channel — see ``_event_key``.
-    A tombstone check makes user deletions stick: if the plugin previously
-    created a recording for this exact event and the row is now gone, the user
-    deleted it on purpose, so it is never re-created ("record the remainder"
-    resurrection was a real user-reported annoyance).
+    ``legacy_keys``: extra OLD-scheme (pre-1.2.0, display-name-based) keys to
+    treat as an exact match, alongside the one this function always derives
+    itself from tag_props's display title -- covers the version transition so
+    a pre-upgrade row isn't mistaken for a brand-new event the first time
+    this version runs. Removable in a future release once every pre-1.2.0
+    row has aged out.
+
+    ``index``: a snapshot from load_auto_dvr_index(), reused across every
+    call in one task run (built once, not once per candidate event) and
+    updated in place after every create/extend/reschedule so two matches
+    within the SAME run still dedup correctly. When None, one is built here
+    (standalone/test use).
+
+    INVARIANT (see the module-level ground-truth this task was built from):
+    every save() of an EXISTING Recording below passes NO update_fields
+    argument. Dispatcharr's pre_save signal revokes + clears task_id in
+    memory for a changed pending row, and only a full save() persists that
+    cleared task_id and lets post_save reschedule; save(update_fields=...)
+    would leave the DB row pointing at an already-deleted Celery task with
+    the recording never firing again.
     """
-    from apps.channels.models import Recording
+    Recording = _recording_model()
 
     event_start_utc = event_start_utc_naive.replace(tzinfo=timezone.utc)
     event_iso = event_start_utc.isoformat()
-    title = ((tag_props or {}).get("program") or {}).get("title", "")
-    key = _event_key(title, event_iso)
+    display_title = ((tag_props or {}).get("program") or {}).get("title", "")
+    id_title = identity_title if identity_title is not None else display_title
+    title_norm = engine.normalize_event_title(id_title)
 
-    # Dedup by event identity across every auto_dvr recording. Legacy rows
-    # (created before event_key existed) are compared via the same key derived
-    # from their stored program title + event_start. The old per-channel
-    # no-event_start fallback is kept for rows of unknown origin.
-    for rec in Recording.objects.all():
-        cp = rec.custom_properties or {}
-        if not cp.get(AUTO_DVR_TAG):
-            continue
-        existing_key = cp.get("event_key") or _event_key(
-            ((cp.get("program") or {}).get("title", "")),
-            cp.get("event_start") or "")
-        if existing_key == key:
-            return False
-        if rec.channel_id == channel_id and cp.get("event_start") is None:
-            return False
-
-    # Tombstone: we created a recording for this event before and its row no
-    # longer exists — the user deleted it. Do not resurrect it.
-    state = _load_dvr_state()
-    if key in state["created"]:
-        logger.info(f"[DVR] [TOMBSTONE] Not re-creating recording for "
-                    f"'{title}' ({event_iso}): previously created and since "
-                    f"deleted by the user")
-        return False
+    # OLD-scheme key, computed exactly as pre-1.2.0 code did (from the
+    # cosmetic display title) -- see _event_key's docstring.
+    legacy_key = _event_key(display_title, event_iso)
+    all_legacy_keys = tuple(dict.fromkeys((legacy_key, *legacy_keys)))
 
     start = event_start_utc - timedelta(minutes=pre_pad_min)
     end = (event_start_utc + timedelta(hours=duration_hours)
            + timedelta(minutes=post_pad_min))
 
-    if max_simultaneous > 0:
-        overlapping = (Recording.objects
-                       .filter(start_time__lt=end, end_time__gt=start)
-                       .exclude(custom_properties__status__in=[
-                           "interrupted", "failed", "stopped", "completed"])
-                       .count())
-        if overlapping >= max_simultaneous:
-            logger.info(
-                f"[MAX-SIMULTANEOUS] Skipping channel {channel_id}: "
-                f"{overlapping} live/pending recording(s) already overlap "
-                f"{start}–{end} (cap {max_simultaneous})")
-            return False
+    desired = {
+        "title_norm": title_norm,
+        "event_iso": event_iso,
+        "event_dt": event_start_utc,
+        "start": start,
+        "end": end,
+    }
 
-    props = {AUTO_DVR_TAG: True, "event_start": event_iso, "event_key": key}
+    if index is None:
+        index = load_auto_dvr_index(Recording)
+    unknown_channel_ids = getattr(index, "unknown_channel_ids", set())
+
+    now = datetime.now(timezone.utc)
+    state = _load_dvr_state(logger)
+    tombstones = set(state.get("created", {}).keys())
+
+    action, target_pk, adjusted_end, reason = engine.decide_recording_action(
+        desired, index, tombstones, now,
+        shift_tolerance_hours=shift_tolerance_hours,
+        max_extension_hours=max_extension_hours,
+        legacy_keys=all_legacy_keys)
+
+    if action == engine.RECONCILE_SKIP:
+        logger.debug(f"[DVR] [SKIP] '{id_title}' ({event_iso}): {reason}")
+        return "skipped"
+
+    if action == engine.RECONCILE_TOMBSTONE:
+        logger.info(f"[DVR] [TOMBSTONE] Not re-creating recording for "
+                    f"'{id_title}' ({event_iso}): previously created and "
+                    f"since deleted by the user")
+        return "tombstoned"
+
+    if action == engine.RECONCILE_EXTEND:
+        rec = Recording.objects.get(pk=target_pk)
+        old_end = rec.end_time
+        rec.end_time = adjusted_end
+        cp = dict(rec.custom_properties or {})
+        if cp.get("event_key_scheme") != 2:
+            cp["event_key"] = engine.event_identity(id_title, event_iso)
+            cp["event_title_norm"] = title_norm
+            cp["event_key_scheme"] = 2
+            rec.custom_properties = cp
+        # INVARIANT: plain save(), no update_fields -- see the function
+        # docstring above. Passing update_fields=["end_time"] here would
+        # trigger pre_save's revoke (task_id cleared in memory only) while
+        # post_save's update_fields early-return skips rescheduling, leaving
+        # the DB row pointing at an already-deleted Celery task.
+        rec.save()
+        logger.info(f"[DVR] [EXTEND] '{id_title}' end_time {old_end} -> {adjusted_end}")
+        _index_update(index, target_pk, end=adjusted_end,
+                     event_key=cp.get("event_key", ""), title_norm=title_norm)
+        return "extended"
+
+    if action == engine.RECONCILE_RESCHEDULE:
+        rec = Recording.objects.get(pk=target_pk)
+        old_start = rec.start_time
+        rec.start_time = start
+        rec.end_time = adjusted_end
+        cp = dict(rec.custom_properties or {})
+        old_key = cp.get("event_key") or ""
+        new_key = engine.event_identity(id_title, event_iso)
+        cp["event_start"] = event_iso
+        cp["event_key"] = new_key
+        cp["event_title_norm"] = title_norm
+        cp["event_key_scheme"] = 2
+        cp["original_end"] = adjusted_end.isoformat()
+        history = list(cp.get("shift_history") or [])
+        history.append({
+            "old_start": old_start.isoformat() if old_start else None,
+            "new_start": start.isoformat(),
+            "at": now.isoformat(),
+        })
+        cp["shift_history"] = history[-20:]
+        rec.custom_properties = cp
+        # INVARIANT: plain save(), no update_fields -- see the function
+        # docstring above (same reasoning as the EXTEND branch).
+        rec.save()
+        logger.warning(f"[DVR] [RESCHEDULE] '{id_title}' shifted from "
+                      f"{old_start} to {start} (end {adjusted_end})")
+        # Carry a tombstone for the old key over to the new one, so a user
+        # who already deleted the recording at the old time still has that
+        # deletion respected after the reschedule.
+        if old_key and old_key in state.get("created", {}):
+            state["created"][new_key] = state["created"].pop(old_key)
+            _save_dvr_state(state, logger)
+        _index_update(index, target_pk, start=start, end=adjusted_end,
+                     event_key=new_key, title_norm=title_norm,
+                     event_iso=event_iso, event_dt=event_start_utc)
+        return "rescheduled"
+
+    shift_live_extended = False
+    if action == engine.RECONCILE_SHIFT_LIVE:
+        rec = Recording.objects.get(pk=target_pk)
+        # Unconditional: fires regardless of whether an extension happens
+        # below, and never asserts what happens next (that would risk being
+        # false if the cap blocks the second recording) -- the accurate
+        # outcome is logged separately, below, once it's actually known.
+        logger.warning(f"[DVR] [SHIFT-LIVE] '{id_title}' time-shifted while "
+                      f"its current recording (id={target_pk}) is already "
+                      f"capturing; evaluating whether to extend it and/or "
+                      f"create a second recording for the new time.")
+        if adjusted_end and rec.end_time and adjusted_end > rec.end_time:
+            old_end = rec.end_time
+            rec.end_time = adjusted_end
+            # INVARIANT: plain save(), no update_fields -- same reasoning as
+            # the EXTEND branch above (this row is actively recording, so
+            # pre_save no-ops anyway, but the invariant is kept uniform).
+            rec.save()
+            logger.info(f"[DVR] [SHIFT-LIVE] '{id_title}' (id={target_pk}) "
+                       f"end_time extended {old_end} -> {adjusted_end}; the "
+                       f"original recording continues uninterrupted.")
+            _index_update(index, target_pk, end=adjusted_end)
+            shift_live_extended = True
+        # Fall through to the create path below: the shifted time is a
+        # distinct broadcast slot from the still-live original.
+
+    # action is RECONCILE_CREATE, or fell through from RECONCILE_SHIFT_LIVE.
+    # Fix 2: a plugin-owned row on this SAME channel that we couldn't parse
+    # a usable event_start out of still suppresses a duplicate -- matches
+    # pre-1.2.0 behavior (see DvrIndex's docstring). Applies to both origins
+    # of this fallthrough (plain CREATE and the SHIFT_LIVE second-recording
+    # path) since either would otherwise create a genuine duplicate here.
+    if channel_id in unknown_channel_ids:
+        logger.debug(f"[DVR] [SKIP] '{id_title}' ({event_iso}): channel "
+                     f"{channel_id} already has an auto-DVR recording with "
+                     f"no parseable event time; not creating a duplicate")
+        return _result("skipped", shift_live_extended)
+
+    # Fix 1: count ANY overlapping Recording (manual or auto_dvr), via a
+    # fresh targeted query -- NOT the plugin-owned-only `index` snapshot
+    # (see _count_overlapping_recordings's docstring).
+    overlapping = _count_overlapping_recordings(Recording, start, end)
+    if overlapping >= max_simultaneous > 0:
+        logger.info(
+            f"[MAX-SIMULTANEOUS] Skipping channel {channel_id}: "
+            f"{overlapping}/{max_simultaneous} live/pending recording(s) "
+            f"already overlap {start}–{end}")
+        if shift_live_extended:
+            logger.warning(f"[DVR] [SHIFT-LIVE] '{id_title}': the second "
+                          f"recording for the shifted time was CAPPED by "
+                          f"max_simultaneous_recordings -- only the "
+                          f"extended original (id={target_pk}) is airing.")
+        return _result("capped", shift_live_extended)
+
+    props = {
+        AUTO_DVR_TAG: True,
+        "event_start": event_iso,
+        "event_key": engine.event_identity(id_title, event_iso),
+        "event_title_norm": title_norm,
+        "event_key_scheme": 2,
+        "original_end": end.isoformat(),
+    }
     props.update(tag_props or {})
 
-    Recording.objects.create(
+    rec = Recording.objects.create(
         channel_id=channel_id,
         start_time=start,
         end_time=end,
         custom_properties=props,
     )
 
-    # Remember the creation so a later user deletion is distinguishable from
-    # "never existed"; prune entries once the event is 2+ days over.
-    cutoff = datetime.now(timezone.utc) - timedelta(days=2)
-
-    def _still_relevant(entry):
-        try:
-            return datetime.fromisoformat(entry.get("end", "")) > cutoff
-        except (ValueError, TypeError):
-            return False
-
-    state["created"][key] = {"end": end.isoformat()}
-    state["created"] = {k: v for k, v in state["created"].items()
-                        if _still_relevant(v)}
+    desired_key = f"{title_norm}|{event_iso}"
+    state.setdefault("created", {})[desired_key] = {"end": end.isoformat()}
     _save_dvr_state(state, logger)
-    return True
+
+    index.append({
+        "pk": rec.id, "title_norm": title_norm, "event_iso": event_iso,
+        "event_dt": event_start_utc, "start": start, "end": end,
+        "status": "", "event_key": props["event_key"], "channel_id": channel_id,
+        "original_end": end,
+    })
+
+    if shift_live_extended:
+        logger.info(f"[DVR] [SHIFT-LIVE] '{id_title}': second recording "
+                   f"created for the shifted time (channel {channel_id}) -- "
+                   f"two max_simultaneous slots are now in use for this "
+                   f"one event.")
+    return _result("created", shift_live_extended)
 
 
 def _has_active_or_future_recording(channel_id: int) -> bool:
@@ -879,10 +1340,10 @@ def _has_active_or_future_recording(channel_id: int) -> bool:
 
 
 def _safe_remove_file(path, logger) -> None:
-    if not path or not isinstance(path, str):
+    if not _under_recordings_root(path):
         return
     try:
-        if any(path.startswith(root) for root in _ALLOWED_FILE_ROOTS) and os.path.exists(path):
+        if os.path.exists(path):
             os.remove(path)
             logger.info(f"[RETENTION] Deleted recording file: {path}")
     except Exception as ex:
@@ -890,11 +1351,15 @@ def _safe_remove_file(path, logger) -> None:
 
 
 def _safe_rmtree_dir(path, logger) -> None:
-    if not path or not isinstance(path, str):
+    if not _under_recordings_root(path):
         return
     try:
-        if any(path.startswith(root) for root in _ALLOWED_FILE_ROOTS) and os.path.isdir(path):
-            shutil.rmtree(path)
+        p = os.path.normpath(path)
+        if os.path.islink(p):
+            logger.warning(f"[RETENTION] Refusing to recurse into a symlink: {path}")
+            return
+        if os.path.isdir(p):
+            shutil.rmtree(p)
             logger.info(f"[RETENTION] Deleted recording HLS directory: {path}")
     except Exception as ex:
         logger.warning(f"[RETENTION] Failed to delete HLS directory {path}: {ex}")
@@ -1048,7 +1513,10 @@ def _row_covers_local_time(start, end, hhmm) -> Optional[bool]:
 def run_teamarr_watch(group_names: List[str], patterns: List[str],
                       excludes: List[str], logger, dry_run: bool,
                       event_duration_hours: float, pre_pad_min: float,
-                      post_pad_min: float, max_simultaneous: int = 0) -> Dict:
+                      post_pad_min: float, max_simultaneous: int = 0,
+                      dvr_index: Optional[List[Dict]] = None,
+                      shift_tolerance_hours: float = 3.0,
+                      max_extension_hours: float = 2.0) -> Dict:
     """Auto-record Teamarr-generated event channels whose EPG programme title
     matches the record patterns.
 
@@ -1056,8 +1524,18 @@ def run_teamarr_watch(group_names: List[str], patterns: List[str],
     channel or its linked EPGData). Recording is opt-in: with no groups or no
     patterns configured this is a no-op. Programme start/end come from the
     channel's linked EPG ProgramData rows.
+
+    ``dvr_index``: the run's shared load_auto_dvr_index() snapshot (see
+    ensure_recording) -- reused here rather than rebuilt, and updated in
+    place so this watcher's creations dedup against the jobs' creations
+    within the same run.
+
+    ``shift_tolerance_hours``/``max_extension_hours``: this watcher isn't
+    tied to one job, so it takes the plugin's GLOBAL settings of the same
+    name (see plugin.py's GLOBAL_FIELDS) rather than a per-job override.
     """
-    stats = {"created": 0, "skipped": 0, "errors": 0}
+    stats = {"created": 0, "skipped": 0, "errors": 0,
+             "extended": 0, "rescheduled": 0, "capped": 0}
     if not group_names or not patterns:
         return stats
 
@@ -1124,16 +1602,23 @@ def run_teamarr_watch(group_names: List[str], patterns: List[str],
                 stats["created"] += 1
                 continue
             try:
-                created = ensure_recording(
+                result = ensure_recording(
                     ch.id, start_naive_utc, dur_hours, pre_pad_min, post_pad_min,
                     {"source": "teamarr-watch", "program": {"title": p.title}},
-                    logger, max_simultaneous=max_simultaneous)
-                if created:
+                    logger, max_simultaneous=max_simultaneous,
+                    identity_title=p.title, index=dvr_index,
+                    shift_tolerance_hours=shift_tolerance_hours,
+                    max_extension_hours=max_extension_hours)
+                if result == "created":
                     logger.info(f"[TEAMARR-WATCH] Scheduled recording for '{p.title}' "
                                 f"(channel {ch.id})")
                     stats["created"] += 1
+                elif result in ("extended", "rescheduled", "capped"):
+                    stats[result] += 1
                 else:
                     stats["skipped"] += 1
+                if getattr(result, "also_extended", False):
+                    stats["extended"] += 1
             except Exception as e:
                 logger.error(f"[TEAMARR-WATCH] Failed to record '{p.title}': {e}")
                 stats["errors"] += 1
@@ -1290,11 +1775,10 @@ def _is_preserved_number(ch_num, job) -> bool:
 
 def _has_excluded_prefix(stream_name: str, prefixes: List[str]) -> bool:
     """EPG-phase country/provider filter: does the stream name start with one
-    of the excluded prefixes (e.g. 'SKY:', 'PL:')? Case-insensitive; both the
-    name and the prefixes are stripped so 'SKY: ' and 'SKY:' behave the same."""
-    name = (stream_name or "").lstrip().lower()
-    return any(name.startswith(p) for p in
-               (p.strip().lower() for p in prefixes) if p)
+    of the excluded prefixes (e.g. 'SKY:', 'PL:')? Case-insensitive, accent/
+    whitespace-folded; both the name and the prefixes are stripped so
+    'SKY: ' and 'SKY:' behave the same."""
+    return any(engine.prefix_matches(p, stream_name) for p in prefixes if p and p.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -1429,19 +1913,28 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
             probe_state: Optional[Dict] = None,
             record_pre_pad_min: float = 5.0,
             record_post_pad_min: float = 30.0,
-            max_simultaneous_recordings: int = 0) -> Dict:
+            max_simultaneous_recordings: int = 0,
+            dvr_index: Optional[List[Dict]] = None) -> Dict:
     """
     Execute one job. Returns a stats dict:
-    {prepared, created, deleted, skipped, preserved, errors}.
+    {prepared, created, deleted, skipped, preserved, errors, recorded,
+     capped, extended, rescheduled, epg_scanned, epg_matched}.
 
     xmltv_cache lets multiple jobs sharing one XMLTV URL/EPG source fetch it
     only once per run. With assign_epg, created channels are linked to real
     EPG data (EPG-search hits) or get a generated event programme
     (name-search hits with a reliable time).
+
+    ``dvr_index``: the run's shared load_auto_dvr_index() snapshot (see
+    ensure_recording), built once per task run (not once per job) and passed
+    down here so recordings across jobs in the same run still dedup against
+    each other correctly.
     """
     client = OrmClient()
     stats = {"prepared": 0, "created": 0, "deleted": 0,
-             "skipped": 0, "preserved": 0, "errors": 0, "recorded": 0}
+             "skipped": 0, "preserved": 0, "errors": 0, "recorded": 0,
+             "capped": 0, "extended": 0, "rescheduled": 0,
+             "epg_scanned": 0, "epg_matched": 0}
 
     channels_to_create: List[Tuple] = []
     all_matched_stream_ids: set = set()
@@ -1535,18 +2028,13 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
         epg_filtered_count = 0
 
         for epg_id, title, desc, start_val, src_label, end_val in programmes:
+            stats["epg_scanned"] += 1
             matches = False
             if not job.search:
                 matches = True
             else:
                 for term in job.search:
-                    term = term.strip()
-                    if not term:
-                        continue
-                    pattern = rf"\b{re.escape(term)}\b"
-                    if re.search(pattern, title, re.IGNORECASE) or (
-                            job.search_descriptions
-                            and re.search(pattern, desc, re.IGNORECASE)):
+                    if engine.term_matches(term, title, desc if job.search_descriptions else ""):
                         matches = True
                         break
             if matches and job.exclude:
@@ -1556,6 +2044,7 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                         break
 
             if matches:
+                stats["epg_matched"] += 1
                 start_utc = (start_val if isinstance(start_val, datetime)
                              else engine.parse_xmltv_time(start_val or ""))
                 if start_utc:
@@ -1684,7 +2173,11 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
             if event_end:
                 span_h = (event_end - start_utc).total_seconds() / 3600.0
                 if 0 < span_h <= 8:  # sanity: ignore absurd guide spans
-                    record_duration_by_name[base_display_name] = span_h
+                    # Keyed on (identity_title, sort_dt) -- the same event
+                    # identity used everywhere else -- not the cosmetic
+                    # display name, so this lookup survives country_flags/
+                    # no_region_label toggles.
+                    record_duration_by_name[(title, start_utc)] = span_h
 
             # Deterministic (tvg_id, source) reference for EPG assignment
             ref_eid, ref_src = sorted(id_pairs)[0]
@@ -1695,13 +2188,13 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                     all_matched_stream_ids.add(s["id"])
                     channels_to_create.append(
                         (base_display_name, [s["id"]], "EPG", title, start_utc, False,
-                         ref_eid, ref_src))
+                         ref_eid, ref_src, title))
             else:
                 ids = [s["id"] for s in streams]
                 all_matched_stream_ids.update(ids)
                 channels_to_create.append(
                     (base_display_name, ids, "EPG", title, start_utc, False,
-                     ref_eid, ref_src))
+                     ref_eid, ref_src, title))
 
         logger.info(f"[{job.name}] [EPG] Prepared {sum(1 for c in channels_to_create if c[2] == 'EPG')} channels")
 
@@ -1716,11 +2209,11 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
         logger.info(f"[{job.name}] PHASE 2: name-based search (with timezone inference)")
         found_streams_by_id: Dict[int, Dict] = {}
         for term in job.search:
-            t = term.strip().lower()
-            if not t:
+            term = term.strip()
+            if not term:
                 continue
             for s in all_streams:
-                if t in s["name"].lower():
+                if engine.contains_normalized(term, s.get("name", "")):
                     found_streams_by_id[s["id"]] = s
         logger.info(f"[{job.name}] [NAME] Found {len(found_streams_by_id)} streams")
 
@@ -1792,9 +2285,14 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
 
                     all_matched_stream_ids.add(s["id"])
                     tvg_id_for_channel = (s.get("tvg_id") or "").strip() or None
+                    # Identity uses clean_stream_name's output, NOT the raw
+                    # stream name -- clean_stream_name already strips provider
+                    # prefixes ("SKY:", "PL:") so it's stable independent of
+                    # the region-label/flag display toggles.
+                    identity_title = engine.clean_stream_name(raw_name)
                     channels_to_create.append(
                         (display_name, [s["id"]], "NAME", raw_name, sort_dt, is_uncertain,
-                         tvg_id_for_channel, None))
+                         tvg_id_for_channel, None, identity_title))
             else:
                 all_ids = [s["id"] for s in streams_list]
                 representative = streams_list[0]
@@ -1816,9 +2314,10 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
 
                 all_matched_stream_ids.update(all_ids)
                 tvg_id_for_channel = (representative.get("tvg_id") or "").strip() or None
+                identity_title = engine.clean_stream_name(raw_name)
                 channels_to_create.append(
                     (display_name, all_ids, "NAME", raw_name, sort_dt, is_uncertain,
-                     tvg_id_for_channel, None))
+                     tvg_id_for_channel, None, identity_title))
 
         if name_filtered_count > 0:
             logger.info(f"[{job.name}] [NAME] Filtered out {name_filtered_count} streams by date/time flags")
@@ -1982,7 +2481,7 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                 return group_channel_id_by_stream[sid]
         return None
 
-    def _maybe_record(chan_id, display_name, reason, sort_dt, is_uncertain):
+    def _maybe_record(chan_id, display_name, reason, sort_dt, is_uncertain, identity_title):
         """Auto-DVR: create a Recording for this event channel if the job's
         record filter matches its title. Opt-in (no patterns → nothing), and
         skipped for dry runs, unknown channel ids, and uncertain-time streams
@@ -1996,18 +2495,25 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
             return
         try:
             # Priority: real EPG span > per-job override > global default.
-            dur_hours = (record_duration_by_name.get(display_name)
+            dur_hours = (record_duration_by_name.get((identity_title, sort_dt))
                          or job.record_duration_hours
                          or event_duration_hours)
-            created_rec = ensure_recording(
+            result = ensure_recording(
                 chan_id, sort_dt, dur_hours,
                 record_pre_pad_min, record_post_pad_min,
                 {"source": "sports-plugin", "job": job.name,
                  "program": {"title": display_name}}, logger,
-                max_simultaneous=max_simultaneous_recordings)
-            if created_rec:
+                max_simultaneous=max_simultaneous_recordings,
+                identity_title=identity_title, index=dvr_index,
+                shift_tolerance_hours=job.record_shift_tolerance_hours,
+                max_extension_hours=job.record_max_extension_hours)
+            if result == "created":
                 logger.info(f"[{job.name}] [DVR] Scheduled recording for '{display_name}'")
                 stats["recorded"] += 1
+            elif result in ("extended", "rescheduled", "capped"):
+                stats[result] += 1
+            if getattr(result, "also_extended", False):
+                stats["extended"] += 1
         except Exception as e:
             logger.error(f"[{job.name}] [DVR] Failed to schedule recording for "
                          f"'{display_name}': {e}")
@@ -2015,19 +2521,19 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
 
     logger.info(f"[{job.name}] Creating/updating {len(channels_to_create)} channels...")
     current_chan_num = job.start_number
-    for display_name, ids, source, reason, sort_dt, is_uncertain, tvg_id, epg_src_label in channels_to_create:
+    for display_name, ids, source, reason, sort_dt, is_uncertain, tvg_id, epg_src_label, identity_title in channels_to_create:
         if display_name in existing_names or any(sid in streams_in_group for sid in ids):
             existing_cid = _resolve_existing_channel_id(display_name, ids)
             if display_name in preserved_names or any(sid in preserved_stream_ids for sid in ids):
                 logger.info(f"[{job.name}] [PRESERVED] [{source}] Kept (below threshold): '{display_name}'")
                 stats["preserved"] += 1
-                _maybe_record(existing_cid, display_name, reason, sort_dt, is_uncertain)
+                _maybe_record(existing_cid, display_name, reason, sort_dt, is_uncertain, identity_title)
                 if current_chan_num is not None:
                     current_chan_num += 1
                 continue
             logger.info(f"[{job.name}] [SKIPPED] [{source}] Already exists in group: '{display_name}'")
             stats["skipped"] += 1
-            _maybe_record(existing_cid, display_name, reason, sort_dt, is_uncertain)
+            _maybe_record(existing_cid, display_name, reason, sort_dt, is_uncertain, identity_title)
             if current_chan_num is not None:
                 current_chan_num += 1
             continue
@@ -2057,7 +2563,7 @@ def run_job(job: SimpleNamespace, logger, dry_run: bool = False,
                     except Exception as e:
                         # EPG is a nicety; never fail the run over it.
                         logger.error(f"[{job.name}] [EPG-ASSIGN] Failed for '{display_name}': {e}")
-                _maybe_record(new_ch["id"], display_name, reason, sort_dt, is_uncertain)
+                _maybe_record(new_ch["id"], display_name, reason, sort_dt, is_uncertain, identity_title)
             except Exception as e:
                 logger.error(f"[{job.name}] [{source}] Failed to create '{display_name}': {e}")
                 stats["errors"] += 1
